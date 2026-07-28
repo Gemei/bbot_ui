@@ -1,0 +1,2907 @@
+#!/usr/bin/env python3
+"""
+BBOT TUI - Self-installing terminal-based interface for browsing BBOT scan results
+
+This script automatically sets up its own virtual environment and dependencies on first run.
+Simply copy this file to any server and run it - no other setup required!
+"""
+
+import sys
+import os
+from pathlib import Path
+
+# Required dependencies
+DEPENDENCIES = [
+    "textual>=0.47.0",
+    "rich>=13.0.0",
+    "psutil>=5.9.0",  # For detecting active scan processes (cross-platform)
+]
+
+def setup_environment():
+    """Set up virtual environment and install dependencies"""
+    script_path = Path(__file__).resolve()
+    venv_dir = Path("~/.bbot_ui_venv").expanduser()
+    marker_file = venv_dir / ".setup_complete"
+
+    # Check if setup is already complete
+    if marker_file.exists():
+        # Setup already done, just use the venv
+        if os.name == 'nt':  # Windows
+            venv_python = venv_dir / "Scripts" / "python.exe"
+        else:  # Unix/Linux/Mac
+            venv_python = venv_dir / "bin" / "python"
+
+        # Re-execute with venv python
+        os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+    print("=" * 60)
+    print("BBOT TUI - First Run Setup")
+    print("=" * 60)
+
+    # Create virtual environment
+    if not venv_dir.exists():
+        print(f"\n[1/3] Creating virtual environment at {venv_dir}")
+        import venv
+        venv.create(venv_dir, with_pip=True)
+        print("✓ Virtual environment created")
+
+    # Determine venv python path
+    if os.name == 'nt':  # Windows
+        venv_python = venv_dir / "Scripts" / "python.exe"
+        venv_pip = venv_dir / "Scripts" / "pip.exe"
+    else:  # Unix/Linux/Mac
+        venv_python = venv_dir / "bin" / "python"
+        venv_pip = venv_dir / "bin" / "pip"
+
+    # Upgrade pip and install dependencies
+    print("\n[2/3] Installing dependencies...")
+    import subprocess
+
+    # Upgrade pip quietly
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-q", "--upgrade", "pip"],
+        check=True
+    )
+
+    # Install dependencies
+    for dep in DEPENDENCIES:
+        print(f"  - Installing {dep}")
+        subprocess.run(
+            [str(venv_pip), "install", "-q", dep],
+            check=True
+        )
+
+    print("✓ All dependencies installed")
+
+    # Create marker file to indicate setup is complete
+    marker_file.touch()
+
+    # Re-execute this script using the venv Python
+    print(f"\n[3/3] Launching BBOT TUI...")
+    print("=" * 60 + "\n")
+
+    os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+# Bootstrap: Check if we need to set up the environment
+if __name__ == "__main__":
+    script_path = Path(__file__).resolve()
+    venv_dir = Path("~/.bbot_ui_venv").expanduser()
+    marker_file = venv_dir / ".setup_complete"
+
+    # Determine if we're running from the venv Python
+    if os.name == 'nt':  # Windows
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:  # Unix/Linux/Mac
+        venv_python = venv_dir / "bin" / "python"
+
+    is_venv_python = venv_python.exists() and Path(sys.executable).resolve() == venv_python.resolve()
+
+    # If marker doesn't exist, run full setup
+    if not marker_file.exists():
+        setup_environment()
+        sys.exit(0)  # Should never reach here due to execv, but just in case
+
+    # If marker exists but we're not running from venv, switch to venv
+    if marker_file.exists() and not is_venv_python:
+        os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+
+    # If we reach here, we're in the venv and ready to run
+
+# ============================================================================
+# Main Application Code (runs only after environment is set up)
+# ============================================================================
+
+import json
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Header,
+    Footer,
+    DataTable,
+    Static,
+    Button,
+    Input,
+    Label,
+    Select,
+    OptionList,
+    TextArea,
+    Rule,
+)
+from textual.widgets.option_list import Option
+from textual.binding import Binding
+from textual.reactive import reactive
+from textual.screen import ModalScreen, Screen
+from textual import work
+from rich.text import Text
+from rich.markup import escape as escape_markup
+import zipfile
+import shutil
+
+
+# ============================================================================
+# Archive Helper Functions
+# ============================================================================
+
+def _get_next_available_name(base_path: Path, is_directory: bool = True) -> Path:
+    """
+    Find the next available name by appending numbers if the path already exists.
+
+    Args:
+        base_path: The desired path (file or directory)
+        is_directory: True if checking for directory, False for file
+
+    Returns:
+        Path that doesn't exist yet (original or numbered variant)
+
+    Examples:
+        - scan_name -> scan_name (if doesn't exist)
+        - scan_name -> scan_name_1 (if scan_name exists)
+        - scan_name.zip -> scan_name_1.zip (if scan_name.zip exists)
+    """
+    if not base_path.exists():
+        return base_path
+
+    # Extract base name and extension
+    if is_directory:
+        name = base_path.name
+        ext = ""
+    else:
+        # For files, handle extension
+        if base_path.name.endswith('.zip'):
+            name = base_path.name[:-4]
+            ext = ".zip"
+        else:
+            name = base_path.stem
+            ext = base_path.suffix
+
+    # Find next available number
+    counter = 1
+    while True:
+        new_name = f"{name}_{counter}{ext}"
+        new_path = base_path.parent / new_name
+        if not new_path.exists():
+            return new_path
+        counter += 1
+
+
+def create_archive(scan_path: Path) -> tuple[bool, str]:
+    """
+    Create a ZIP archive from a scan folder.
+
+    Args:
+        scan_path: Path to the scan directory to archive
+
+    Returns:
+        Tuple of (success, message)
+        - success: True if archive created successfully, False otherwise
+        - message: Error message if failed, success message if succeeded
+    """
+    try:
+        base_archive_path = scan_path.parent / f"{scan_path.name}.zip"
+
+        # Get next available archive name (handles duplicates)
+        archive_path = _get_next_available_name(base_archive_path, is_directory=False)
+
+        # Determine the folder name to use inside the ZIP (match the ZIP filename without .zip)
+        zip_internal_folder_name = archive_path.name[:-4]  # Remove .zip extension
+
+        # Create ZIP archive
+        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Walk through all files in scan directory
+            for root, dirs, files in os.walk(scan_path):
+                for file in files:
+                    file_path = Path(root) / file
+                    # Calculate relative path within the scan folder
+                    rel_path = file_path.relative_to(scan_path)
+                    # Store with the ZIP's name as the root folder
+                    arcname = Path(zip_internal_folder_name) / rel_path
+                    zipf.write(file_path, arcname)
+
+        # Verify archive integrity
+        with zipfile.ZipFile(archive_path, 'r') as zipf:
+            bad_file = zipf.testzip()
+            if bad_file is not None:
+                # Archive is corrupted
+                archive_path.unlink()  # Delete bad archive
+                return (False, f"Archive verification failed: {bad_file} is corrupted")
+
+        # Archive is good, now delete the source folder
+        shutil.rmtree(scan_path)
+
+        return (True, f"Successfully archived to {archive_path.name}")
+
+    except Exception as e:
+        # Clean up incomplete archive if it exists
+        if 'archive_path' in locals() and archive_path.exists():
+            try:
+                archive_path.unlink()
+            except:
+                pass
+        return (False, f"Failed to create archive: {str(e)}")
+
+
+def extract_archive(archive_path: Path) -> tuple[bool, str]:
+    """
+    Extract a ZIP archive back to a scan folder.
+
+    Args:
+        archive_path: Path to the ZIP archive
+
+    Returns:
+        Tuple of (success, message)
+        - success: True if extracted successfully, False otherwise
+        - message: Error message if failed, success message if succeeded
+    """
+    try:
+        # Determine extraction path (remove .zip extension)
+        if not archive_path.name.endswith('.zip'):
+            return (False, "Not a ZIP file")
+
+        # The folder name inside the ZIP matches the ZIP filename (without .zip)
+        scan_name = archive_path.name[:-4]  # Remove .zip
+        extract_path = archive_path.parent / scan_name
+
+        # Check if directory already exists
+        if extract_path.exists():
+            return (False, f"Directory already exists: {scan_name}. Delete or rename it first.")
+
+        # Extract archive
+        with zipfile.ZipFile(archive_path, 'r') as zipf:
+            zipf.extractall(archive_path.parent)
+
+        # Verify extraction by checking for output.json
+        output_json = extract_path / "output.json"
+        if not output_json.exists():
+            # Extraction failed or invalid scan
+            shutil.rmtree(extract_path)
+            return (False, "Invalid scan archive: output.json not found")
+
+        # Try to read first line to verify it's valid
+        try:
+            with open(output_json, 'r') as f:
+                first_line = f.readline()
+                json.loads(first_line)
+        except:
+            # output.json is corrupted
+            shutil.rmtree(extract_path)
+            return (False, "Invalid scan archive: output.json is corrupted")
+
+        # Extraction successful, delete archive
+        archive_path.unlink()
+
+        return (True, f"Successfully restored {scan_name}")
+
+    except Exception as e:
+        # Clean up incomplete extraction if it exists
+        try:
+            if extract_path.exists():
+                shutil.rmtree(extract_path)
+        except:
+            pass
+        return (False, f"Failed to extract archive: {str(e)}")
+
+
+def get_archive_stats(archive_path: Path) -> dict:
+    """
+    Get statistics from a ZIP archive without extracting it.
+
+    Args:
+        archive_path: Path to the ZIP archive
+
+    Returns:
+        Dictionary with keys: size, date, event_count, vuln_count, finding_count
+        Returns empty dict on error
+    """
+    try:
+        stat = archive_path.stat()
+
+        stats = {
+            'size': stat.st_size,
+            'date': datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            'event_count': 0,
+            'vuln_count': 0,
+            'finding_count': 0,
+        }
+
+        # Try to read output.json from archive to get event counts
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as zipf:
+                # The folder name inside matches the ZIP filename (without .zip)
+                scan_name = archive_path.name[:-4]  # Remove .zip
+                output_json_path = f"{scan_name}/output.json"
+
+                if output_json_path in zipf.namelist():
+                    # Get the compressed file info
+                    file_info = zipf.getinfo(output_json_path)
+                    uncompressed_size = file_info.file_size
+
+                    with zipf.open(output_json_path, 'r') as f:
+                        # For smaller files (<1MB), count exactly
+                        if uncompressed_size < 1_000_000:
+                            content = f.read().decode('utf-8', errors='ignore')
+                            for line in content.split('\n'):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                    event_type = event.get("type", "")
+                                    if event_type != "SCAN":
+                                        stats['event_count'] += 1
+                                    if event_type == "VULNERABILITY":
+                                        stats['vuln_count'] += 1
+                                    elif event_type == "FINDING":
+                                        stats['finding_count'] += 1
+                                except:
+                                    continue
+                        else:
+                            # For larger files, estimate based on sampling
+                            sample_size = 100000
+                            content = f.read(sample_size).decode('utf-8', errors='ignore')
+
+                            sample_events = 0
+                            sample_vulns = 0
+                            sample_findings = 0
+
+                            for line in content.split('\n'):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                    event_type = event.get("type", "")
+                                    if event_type != "SCAN":
+                                        sample_events += 1
+                                    if event_type == "VULNERABILITY":
+                                        sample_vulns += 1
+                                    elif event_type == "FINDING":
+                                        sample_findings += 1
+                                except:
+                                    continue
+
+                            # Estimate total based on sample ratio
+                            ratio = uncompressed_size / sample_size
+                            stats['event_count'] = int(sample_events * ratio)
+                            stats['vuln_count'] = int(sample_vulns * ratio)
+                            stats['finding_count'] = int(sample_findings * ratio)
+        except:
+            # If we can't read the archive, just return basic stats
+            pass
+
+        return stats
+
+    except:
+        return {}
+
+
+# ============================================================================
+# Annotation System
+# ============================================================================
+
+# Status options (single choice)
+STATUS_OPTIONS = {
+    "new": {"label": "🆕 New", "color": "gray"},
+    "investigating": {"label": "🔍 Investigating", "color": "yellow"},
+    "confirmed": {"label": "✓ Confirmed", "color": "red"},
+    "false-positive": {"label": "✗ False Positive", "color": "green"},
+    "reported": {"label": "📢 Reported", "color": "blue"},
+    "fixed": {"label": "🔧 Fixed", "color": "bright_green"},
+    "accepted-risk": {"label": "⚠ Accepted Risk", "color": "magenta"},
+}
+
+# Priority options (single choice, optional)
+PRIORITY_OPTIONS = {
+    "critical": {"label": "🔴 Critical", "color": "red"},
+    "high": {"label": "🟠 High", "color": "bright_red"},
+    "medium": {"label": "🟡 Medium", "color": "yellow"},
+    "low": {"label": "🟢 Low", "color": "green"},
+}
+
+# Custom tags (multi-choice, optional)
+CUSTOM_TAGS = [
+    "reviewed",
+    "needs-validation",
+    "duplicate",
+    "needs-retest",
+    "escalated",
+]
+
+# Actionable statuses (items that still need work/attention)
+ACTIONABLE_STATUSES = ["new", "investigating", "confirmed", "reported"]
+
+# Severity / status visual styles for tables and badges
+SEVERITY_STYLES = {
+    "CRITICAL": "bold white on dark_red",
+    "HIGH": "bold red",
+    "MEDIUM": "bold yellow",
+    "LOW": "green",
+    "INFO": "cyan",
+    "UNKNOWN": "dim",
+}
+
+STATUS_RICH_STYLES = {
+    "gray": "dim",
+    "yellow": "yellow",
+    "red": "red",
+    "green": "green",
+    "blue": "blue",
+    "bright_green": "bold green",
+    "magenta": "magenta",
+}
+
+
+def style_severity(severity: str) -> Text:
+    """Return a colored severity label for DataTable cells."""
+    s = (severity or "UNKNOWN").upper()
+    return Text(s, style=SEVERITY_STYLES.get(s, "dim"))
+
+
+def style_annotation_label(status_key: str, label: str) -> Text:
+    """Color an annotation status/priority label."""
+    color = STATUS_OPTIONS.get(status_key, {}).get("color") or PRIORITY_OPTIONS.get(status_key, {}).get("color", "white")
+    return Text(label, style=STATUS_RICH_STYLES.get(color, "white"))
+
+
+def format_event_plain(event: Dict[str, Any], scan_data: Optional["ScanData"] = None) -> str:
+    """Human-readable plain text for an event (good for clipboard)."""
+    if not event:
+        return ""
+    event_type = event.get("type", "UNKNOWN")
+    if scan_data:
+        data = scan_data._get_event_data(event)
+    else:
+        data = event.get("data_json") or event.get("data", {})
+
+    lines = [event_type, ""]
+    if event_type == "VULNERABILITY" and isinstance(data, dict):
+        lines.append(f"Severity: {data.get('severity', 'UNKNOWN')}")
+        lines.append("")
+    if isinstance(data, dict):
+        host = data.get("host", event.get("host", "N/A"))
+        lines.append(f"Host: {host}")
+        if data.get("url"):
+            lines.append(f"URL: {data.get('url')}")
+        lines.append("")
+        if data.get("description"):
+            lines.append("Description:")
+            lines.append(str(data.get("description")))
+            lines.append("")
+        # Remaining key fields
+        for key in ("name", "severity", "path", "title"):
+            if key in data and key not in ("severity",) and data[key] not in (None, ""):
+                if key == "name":
+                    lines.append(f"Name: {data[key]}")
+    else:
+        lines.append(f"Data: {data}")
+        lines.append("")
+
+    lines.append(f"Module: {event.get('module', 'N/A')}")
+    if event.get("module_sequence"):
+        lines.append(f"Module Sequence: {event.get('module_sequence')}")
+    if event.get("discovery_context"):
+        lines.append("")
+        lines.append("Discovery Context:")
+        lines.append(str(event.get("discovery_context")))
+    discovery_path = event.get("discovery_path") or []
+    if discovery_path:
+        lines.append("")
+        lines.append("Discovery Path:")
+        for i, step in enumerate(discovery_path, 1):
+            lines.append(f"{i}. {step}")
+    tags = event.get("tags") or []
+    if tags:
+        lines.append("")
+        lines.append(f"Tags: {', '.join(str(t) for t in tags)}")
+    if event.get("timestamp") is not None:
+        lines.append("")
+        lines.append(f"Timestamp: {event.get('timestamp')}")
+    resolved = event.get("resolved_hosts") or []
+    if resolved:
+        lines.append(f"Resolved IPs: {', '.join(str(h) for h in resolved)}")
+    if event.get("port") is not None:
+        lines.append(f"Port: {event.get('port')}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def notify_copied(screen: Screen, label: str, text: str) -> None:
+    """Copy text to clipboard and show a short toast."""
+    if text is None or text == "":
+        screen.notify("Nothing to copy", severity="warning", timeout=2)
+        return
+    screen.app.copy_to_clipboard(text)
+    preview = " ".join(str(text).split())
+    if len(preview) > 72:
+        preview = preview[:72] + "…"
+    screen.notify(f"Copied {label}: {preview}", title="Clipboard", timeout=2)
+
+
+class AnnotationManager:
+    """Manages annotations for a scan"""
+
+    def __init__(self, scan_path: Path):
+        self.scan_path = scan_path
+        self.annotation_file = scan_path / ".bbot_ui_annotations.json"
+        self.annotations = self.load()
+
+    def _create_empty(self) -> dict:
+        """Create empty annotation structure"""
+        return {
+            "version": "1.0",
+            "scan_name": self.scan_path.name,
+            "created_at": datetime.utcnow().isoformat() + 'Z',
+            "updated_at": datetime.utcnow().isoformat() + 'Z',
+            "annotations": {}
+        }
+
+    def load(self) -> dict:
+        """Load annotations from file"""
+        if not self.annotation_file.exists():
+            return self._create_empty()
+
+        try:
+            with self.annotation_file.open('r') as f:
+                return json.load(f)
+        except:
+            # If file is corrupted, start fresh
+            return self._create_empty()
+
+    def save(self):
+        """Save annotations to file"""
+        self.annotations['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        try:
+            with self.annotation_file.open('w') as f:
+                json.dump(self.annotations, f, indent=2)
+        except Exception as e:
+            # Log error but don't crash
+            pass
+
+    def get_annotation(self, uuid: str) -> dict:
+        """Get annotation for event UUID"""
+        return self.annotations['annotations'].get(uuid, {})
+
+    def set_annotation(self, uuid: str, status: str = None,
+                      priority: str = None, custom_tags: list = None,
+                      note: str = None):
+        """Set or update annotation"""
+        if uuid not in self.annotations['annotations']:
+            self.annotations['annotations'][uuid] = {
+                'created_at': datetime.utcnow().isoformat() + 'Z'
+            }
+
+        ann = self.annotations['annotations'][uuid]
+
+        if status is not None:
+            ann['status'] = status
+        if priority is not None:
+            ann['priority'] = priority
+        if custom_tags is not None:
+            ann['custom_tags'] = custom_tags
+        if note is not None:
+            ann['note'] = note
+
+        ann['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        self.save()
+
+    def delete_annotation(self, uuid: str):
+        """Remove annotation"""
+        if uuid in self.annotations['annotations']:
+            del self.annotations['annotations'][uuid]
+            self.save()
+
+    def get_stats(self) -> dict:
+        """Get annotation statistics"""
+        stats = {
+            'total': len(self.annotations['annotations']),
+            'by_status': {},
+            'by_priority': {},
+        }
+
+        for ann in self.annotations['annotations'].values():
+            status = ann.get('status', 'new')
+            stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+
+            if 'priority' in ann:
+                priority = ann['priority']
+                stats['by_priority'][priority] = stats['by_priority'].get(priority, 0) + 1
+
+        return stats
+
+
+class ScanData:
+    """Parse and manage BBOT scan data"""
+
+    def __init__(self, scan_path: Path):
+        self.scan_path = scan_path
+        self.scan_name = scan_path.name
+        self.events: List[Dict[str, Any]] = []
+        self.scan_info: Dict[str, Any] = {}
+        self.preset_content: str = ""
+        self.subdomains: List[str] = []
+        self.has_subdomains: bool = False
+        self.file_position: int = 0  # Track position in output.json for incremental reads
+        self.file_handler_cache = None  # Cache for file handler check: (result, timestamp)
+        self.cache_ttl = 5.0  # Cache results for 5 seconds
+        self.annotation_manager = AnnotationManager(scan_path)  # Annotation system
+        self.bbot_version = "unknown"  # BBOT version detection: "2.x", "3.0", or "unknown"
+        self.load_events()
+        self.load_preset()
+        self.load_subdomains()
+
+    def load_events(self):
+        """Load events from output.json and detect BBOT version"""
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return
+
+        with open(json_file, "r") as f:
+            first_event = True
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        event = json.loads(line)
+
+                        # Detect version from first event
+                        if first_event:
+                            self.bbot_version = self._detect_version(event)
+                            first_event = False
+
+                        if event.get("type") == "SCAN":
+                            # Keep the LAST SCAN event (overwrite previous ones)
+                            self.scan_info = event
+                        else:
+                            self.events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+
+        # Update file position
+        try:
+            self.file_position = json_file.stat().st_size
+        except:
+            pass
+
+    def _check_file_open_psutil(self, file_path: Path) -> bool:
+        """
+        Check if file is open using psutil (native Python, cross-platform).
+        Returns True if open, False if not, None if psutil unavailable.
+        """
+        try:
+            import psutil
+            file_path_str = str(file_path.resolve())
+
+            # Iterate through all processes
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    # Check if process has the file open
+                    for open_file in proc.open_files():
+                        if open_file.path == file_path_str:
+                            return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    # Process ended or we don't have permission
+                    continue
+
+            return False
+        except ImportError:
+            # psutil not available
+            return None
+        except Exception:
+            # Other error
+            return None
+
+
+    def _has_active_file_handler(self, file_path: Path) -> bool:
+        """
+        Check if any process has an active file handler on the given file.
+        Uses caching to avoid expensive checks on every refresh.
+        Returns True if file is open, False if not.
+        """
+        import time
+
+        # Check cache first
+        if self.file_handler_cache is not None:
+            cached_result, cached_time = self.file_handler_cache
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_result
+
+        # Use psutil (auto-installed dependency, cross-platform)
+        result = self._check_file_open_psutil(file_path)
+        if result is not None:
+            self.file_handler_cache = (result, time.time())
+            return result
+
+        # psutil failed (should never happen) - assume file is open to be safe
+        return True
+
+    def get_scan_status(self) -> str:
+        """
+        Get the current scan status.
+        Returns: "RUNNING", "FINISHED", "INTERRUPTED", or "UNKNOWN"
+        """
+        scan_data = self._get_scan_data(self.scan_info)
+        status = scan_data.get("status", "UNKNOWN")
+
+        # Only check for active processes if status is RUNNING
+        # Skip expensive checks for FINISHED scans
+        if status == "RUNNING":
+            json_file = self.scan_path / "output.json"
+            if json_file.exists():
+                # Check if process has file open (uses psutil with caching)
+                if not self._has_active_file_handler(json_file):
+                    # No process has the file open -> scan is interrupted
+                    return "INTERRUPTED"
+
+        return status
+
+    def is_scan_running(self) -> bool:
+        """Check if the scan is currently running (not interrupted or finished)"""
+        return self.get_scan_status() == "RUNNING"
+
+    def check_for_updates(self) -> bool:
+        """Check if output.json has new data and scan is still running"""
+        status = self.get_scan_status()
+
+        # Don't check for updates if scan is finished or interrupted
+        if status in ["FINISHED", "INTERRUPTED"]:
+            return False
+
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return False
+
+        try:
+            current_size = json_file.stat().st_size
+
+            # Check if file has grown
+            if current_size > self.file_position:
+                return True
+        except:
+            pass
+
+        return False
+
+    def load_new_events(self) -> int:
+        """Load only new events that have been added since last read. Returns number of new events."""
+        json_file = self.scan_path / "output.json"
+        if not json_file.exists():
+            return 0
+
+        new_event_count = 0
+
+        try:
+            with open(json_file, "r") as f:
+                # Seek to last known position
+                f.seek(self.file_position)
+
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "SCAN":
+                                # Always update scan info to keep the LAST SCAN event
+                                self.scan_info = event
+                            else:
+                                self.events.append(event)
+                                new_event_count += 1
+                        except json.JSONDecodeError:
+                            # Skip malformed lines (might be incomplete writes)
+                            continue
+
+            # Update file position
+            self.file_position = json_file.stat().st_size
+
+        except Exception as e:
+            # If there's an error reading incrementally, we'll try again next time
+            pass
+
+        return new_event_count
+
+    def load_preset(self):
+        """Load preset configuration from preset.yml"""
+        preset_file = self.scan_path / "preset.yml"
+        if preset_file.exists():
+            try:
+                with open(preset_file, 'r') as f:
+                    self.preset_content = f.read()
+            except Exception as e:
+                self.preset_content = f"Error loading preset: {e}"
+        else:
+            self.preset_content = "No preset.yml found in scan directory"
+
+    def load_subdomains(self):
+        """Load subdomains from subdomains.txt if present"""
+        subdomains_file = self.scan_path / "subdomains.txt"
+        if subdomains_file.exists():
+            try:
+                with open(subdomains_file, 'r') as f:
+                    self.subdomains = [line.strip() for line in f if line.strip()]
+                self.has_subdomains = len(self.subdomains) > 0
+            except Exception as e:
+                self.subdomains = []
+                self.has_subdomains = False
+        else:
+            self.subdomains = []
+            self.has_subdomains = False
+
+    def _detect_version(self, event: Dict[str, Any]) -> str:
+        """Detect BBOT version from event timestamp format"""
+        timestamp = event.get("timestamp")
+
+        if timestamp is None:
+            return "unknown"
+
+        if isinstance(timestamp, (int, float)):
+            return "3.0"
+        elif isinstance(timestamp, str) and "T" in timestamp:
+            return "2.x"
+        else:
+            return "unknown"
+
+    def _parse_timestamp(self, timestamp):
+        """Parse timestamp based on BBOT version"""
+        from datetime import datetime
+
+        if self.bbot_version == "3.0":
+            # Unix epoch float
+            try:
+                return datetime.fromtimestamp(timestamp)
+            except:
+                return datetime.now()
+        elif self.bbot_version == "2.x":
+            # ISO 8601 string
+            try:
+                ts_str = str(timestamp).replace("+00:00", "")
+                return datetime.fromisoformat(ts_str)
+            except:
+                return datetime.now()
+        else:
+            # Fallback: Try both methods
+            try:
+                if isinstance(timestamp, (int, float)):
+                    return datetime.fromtimestamp(timestamp)
+                else:
+                    ts_str = str(timestamp).replace("+00:00", "")
+                    return datetime.fromisoformat(ts_str)
+            except:
+                return datetime.now()
+
+    def _get_event_data(self, event: Dict[str, Any]) -> Any:
+        """Extract event data based on BBOT version (works for all event types)
+
+        Returns the data value which can be:
+        - A dict (for complex events like VULNERABILITY, FINDING, SCAN)
+        - A string or other simple value (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
+        """
+        if self.bbot_version == "3.0":
+            # BBOT 3.0: Try data_json first (for VULNERABILITY, FINDING, SCAN)
+            # Fall back to data (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
+            if "data_json" in event:
+                return event.get("data_json", {})
+            else:
+                return event.get("data", {})
+        else:
+            # BBOT 2.x: Always use data
+            return event.get("data", {})
+
+    def _get_scan_data(self, scan_event: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract scan data based on BBOT version (alias for _get_event_data for backward compatibility)"""
+        return self._get_event_data(scan_event)
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Calculate statistics from events"""
+        event_types = {}
+        modules = {}
+        scope_distances = {}
+
+        for event in self.events:
+            event_type = event.get("type", "UNKNOWN")
+            module = event.get("module", "UNKNOWN")
+            scope_dist = event.get("scope_distance", 0)
+
+            event_types[event_type] = event_types.get(event_type, 0) + 1
+            modules[module] = modules.get(module, 0) + 1
+            scope_distances[scope_dist] = scope_distances.get(scope_dist, 0) + 1
+
+        # Get started_at and format it for display
+        started_at_raw = self._get_scan_data(self.scan_info).get("started_at", "Unknown")
+        if started_at_raw != "Unknown":
+            try:
+                started_at = self._parse_timestamp(started_at_raw).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                started_at = str(started_at_raw)
+        else:
+            started_at = "Unknown"
+
+        return {
+            "total_events": len(self.events),
+            "event_types": event_types,
+            "modules": modules,
+            "scope_distances": scope_distances,
+            "scan_name": self.scan_name,
+            "started_at": started_at,
+        }
+
+# ============================================================================
+# Shared table / detail widgets
+# ============================================================================
+
+class SelectableTable(DataTable):
+    """DataTable with text selection, zebra rows, and TSV export for copy."""
+
+    ALLOW_SELECT = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+
+    @staticmethod
+    def _cell_text(value: Any) -> str:
+        """Normalize a cell value to plain text for clipboard export."""
+        if value is None:
+            return ""
+        if isinstance(value, Text):
+            return value.plain
+        # Rich renderables / markup leftovers
+        text = str(value)
+        # Collapse internal newlines so one table row = one TSV line
+        return " ".join(text.split())
+
+    def column_labels(self) -> List[str]:
+        labels = []
+        for col in self.ordered_columns:
+            label = col.label
+            labels.append(label.plain if isinstance(label, Text) else str(label))
+        return labels
+
+    def row_values(self, row_index: int) -> List[str]:
+        """Return plain-text cell values for a visible row index."""
+        if row_index < 0 or row_index >= self.row_count:
+            return []
+        try:
+            cells = self.get_row_at(row_index)
+        except Exception:
+            return []
+        return [self._cell_text(c) for c in cells]
+
+    def export_tsv(
+        self,
+        *,
+        row_indices: Optional[List[int]] = None,
+        include_header: bool = True,
+    ) -> str:
+        """
+        Export table data as tab-separated text.
+
+        Args:
+            row_indices: Specific rows to export. None = all rows.
+            include_header: Prepend column labels.
+        """
+        lines: List[str] = []
+        headers = self.column_labels()
+        if include_header and headers:
+            lines.append("\t".join(headers))
+
+        if row_indices is None:
+            indices = list(range(self.row_count))
+        else:
+            indices = row_indices
+
+        for idx in indices:
+            vals = self.row_values(idx)
+            if not vals and not headers:
+                continue
+            # Pad/truncate to header width when possible
+            if headers:
+                if len(vals) < len(headers):
+                    vals = vals + [""] * (len(headers) - len(vals))
+                elif len(vals) > len(headers):
+                    vals = vals[: len(headers)]
+            lines.append("\t".join(vals))
+
+        return "\n".join(lines).rstrip() + ("\n" if lines else "")
+
+    def export_selected_row_tsv(self) -> str:
+        """Export the cursor row (with header) as TSV."""
+        row = self.cursor_row
+        if row is None or row < 0 or self.row_count == 0:
+            return ""
+        return self.export_tsv(row_indices=[row], include_header=True)
+
+    def export_all_tsv(self) -> str:
+        """Export the full visible table as TSV."""
+        return self.export_tsv(row_indices=None, include_header=True)
+
+
+class DetailPane(Vertical):
+    """Right-hand detail pane backed by a read-only TextArea (easy to select/copy)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.plain_text = ""
+        self.json_text = ""
+        self._title = Static("Details", classes="pane-title")
+        self._body = TextArea(
+            "Select a row to view details.\n\n"
+            "Keys: c copy row · Shift+C copy table · y JSON · Ctrl+C selection",
+            id="detail-text",
+            read_only=True,
+            show_line_numbers=False,
+        )
+
+    def compose(self) -> ComposeResult:
+        yield self._title
+        yield self._body
+
+    def set_empty(self, message: str = "Select a row to view details.") -> None:
+        self.plain_text = ""
+        self.json_text = ""
+        self._title.update("Details")
+        self._body.load_text(
+            f"{message}\n\nKeys: c copy row · Shift+C copy table · y JSON · Ctrl+C selection"
+        )
+
+    def set_text(self, title: str, plain: str, json_text: str = "") -> None:
+        plain = plain or ""
+        json_text = json_text or plain or ""
+        # Skip TextArea reload when content unchanged (big win while arrowing rows slowly)
+        if plain == self.plain_text and json_text == self.json_text:
+            self._title.update(title)
+            return
+        self.plain_text = plain
+        self.json_text = json_text
+        self._title.update(title)
+        self._body.load_text(self.plain_text if self.plain_text else "(empty)")
+
+    def set_json(self, title: str, obj: Any) -> None:
+        text = json.dumps(obj, indent=2, default=str) if obj else ""
+        self.set_text(title, text, text)
+
+
+# ============================================================================
+# Dialogs
+# ============================================================================
+
+class HelpScreen(ModalScreen[None]):
+    """Keyboard reference."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("q", "close", "Close", show=False),
+        Binding("question_mark", "close", "Close", show=False),
+    ]
+
+    HELP = """BBOT TUI — Help
+
+COPYING
+  c        Copy selected table row (TSV, with headers)
+  Shift+C  Copy entire visible table (TSV)
+  y        Copy full JSON / details of current item
+  Ctrl+C   Copy mouse drag-selection (or Super+C)
+  Shift+drag if the terminal captures the mouse
+
+BROWSER (scan list)
+  Enter   Open scan
+  /       Focus filter
+  1       Show live scans
+  2       Show archives
+  a       Archive selected scan
+  u       Unarchive selected archive
+  d       Delete selected
+  r       Refresh
+  c / C   Copy row / whole table
+  ?       Help
+  q       Quit
+
+WORKSPACE (inside a scan)
+  Views (issues → assets → raw → meta):
+    1 Vulns · 2 Findings
+    3 IPs · 4 Emails · 5 Social · 6 Subdomains
+    7 Events · 8 Stats · 9 Preset
+  Tab     Cycle views
+  / or f  Focus filter / search
+  Type dropdown: Events · Platform dropdown: Social
+  t       Annotate (vulns/findings)
+  x       Mark false positive
+  i       Mark accepted risk
+  r       Refresh
+  c / C   Copy row / whole table
+  y       Copy JSON details
+  q/Esc   Back to browser
+"""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Static(self.HELP, id="help-body", markup=False)
+            yield Button("Close", variant="primary", id="help-close")
+
+    def on_mount(self) -> None:
+        self.query_one("#help-close", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+class ConfirmDialog(ModalScreen[bool]):
+    """Yes/No confirmation."""
+
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static(self.message, id="dialog-message", markup=False)
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel", variant="default", id="cancel")
+                yield Button("Confirm", variant="error", id="confirm")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(False)
+            event.stop()
+        elif event.key == "enter":
+            self.dismiss(True)
+            event.stop()
+
+
+class AnnotationDialog(ModalScreen[Optional[dict]]):
+    """Edit status / priority / notes for a vuln or finding."""
+
+    def __init__(self, event_data: dict, current: dict):
+        super().__init__()
+        self.event_data = event_data
+        self.current = current or {}
+
+    def compose(self) -> ComposeResult:
+        etype = self.event_data.get("type", "EVENT")
+        data = self.event_data.get("data_json") or self.event_data.get("data") or {}
+        host = data.get("host", "") if isinstance(data, dict) else ""
+        desc = ""
+        if isinstance(data, dict):
+            desc = str(data.get("description", ""))[:120]
+
+        with Vertical(id="annotation-dialog"):
+            yield Static(f"{etype}  {host}", id="annotation-title", markup=False)
+            yield Static(desc, id="annotation-description", markup=False)
+            yield Label("Status")
+            yield Select(
+                options=[(v["label"], k) for k, v in STATUS_OPTIONS.items()],
+                value=self.current.get("status", "new"),
+                id="status-select",
+                allow_blank=False,
+            )
+            yield Label("Priority (optional)")
+            yield Select(
+                options=[("(none)", "")] + [(v["label"], k) for k, v in PRIORITY_OPTIONS.items()],
+                value=self.current.get("priority", "") or "",
+                id="priority-select",
+            )
+            yield Label("Notes")
+            yield Input(
+                value=self.current.get("note", "") or "",
+                placeholder="Optional notes…",
+                id="note-input",
+            )
+            with Horizontal(id="annotation-buttons"):
+                yield Button("Cancel", id="cancel")
+                if self.current:
+                    yield Button("Clear", variant="warning", id="clear")
+                yield Button("Save", variant="primary", id="save")
+
+    def on_mount(self) -> None:
+        self.query_one("#save", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "cancel":
+            self.dismiss(None)
+        elif bid == "clear":
+            self.dismiss({})
+        elif bid == "save":
+            status = self.query_one("#status-select", Select).value
+            priority = self.query_one("#priority-select", Select).value
+            note = self.query_one("#note-input", Input).value
+            self.dismiss({
+                "status": status,
+                "priority": priority if priority else None,
+                "note": note if note else None,
+            })
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+            event.stop()
+
+
+# ============================================================================
+# Browser — scans + archives in one screen
+# ============================================================================
+
+class BrowserScreen(Screen):
+    """Browse live scans and archives."""
+
+    BINDINGS = [
+        Binding("q", "app.quit", "Quit"),
+        Binding("escape", "app.quit", "Quit", show=False),
+        Binding("r", "refresh", "Refresh"),
+        Binding("slash", "focus_filter", "Filter"),
+        Binding("1", "show_scans", "Scans"),
+        Binding("2", "show_archives", "Archives"),
+        Binding("a", "archive", "Archive"),
+        Binding("u", "unarchive", "Unarchive"),
+        Binding("d", "delete", "Delete"),
+        Binding("c", "copy_row", "Copy row"),
+        Binding("shift+c", "copy_table", "Copy table"),
+        Binding("question_mark", "help", "Help"),
+        Binding("enter", "open_row", "Open", show=False),
+    ]
+
+    mode = reactive("scans")  # "scans" | "archives"
+
+    def __init__(self, scans_dir: Path, refresh_interval: float = 3.0):
+        super().__init__()
+        self.scans_dir = scans_dir
+        self.refresh_interval = refresh_interval
+        self.scans: List[Dict[str, Any]] = []
+        self.archives: List[Dict[str, Any]] = []
+        self.rows: List[Dict[str, Any]] = []
+        self.filter_query = ""
+        self._timer = None
+        self._loading = False
+        # Cache: path -> (mtime, size, summary_tuple)
+        self._summary_cache: Dict[str, tuple] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="browser-root"):
+            yield Static("", id="browser-title")
+            with Horizontal(id="browser-toolbar"):
+                yield Static("[b]1[/] Scans  [b]2[/] Archives", id="mode-hint")
+                yield Input(placeholder="Filter by name…  (/)", id="browser-filter")
+                yield Button("Refresh", id="btn-refresh", variant="default")
+            yield SelectableTable(id="browser-table")
+            yield Static("", id="browser-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#browser-table", SelectableTable)
+        table.add_columns("Name", "Status", "Events", "Vulns", "Findings", "Modified")
+        self._set_title()
+        self.action_refresh()
+        self._timer = self.set_interval(self.refresh_interval, self._auto_refresh)
+
+    def on_unmount(self) -> None:
+        if self._timer:
+            self._timer.stop()
+
+    def _set_title(self) -> None:
+        path = escape_markup(str(self.scans_dir))
+        mode = "SCANS" if self.mode == "scans" else "ARCHIVES"
+        self.query_one("#browser-title", Static).update(
+            f"[bold]BBOT[/]  [dim]{path}[/]  ·  [cyan]{mode}[/]"
+        )
+
+    def watch_mode(self, mode: str) -> None:
+        self._set_title()
+        self._rebuild_table()
+
+    def action_show_scans(self) -> None:
+        self.mode = "scans"
+        self._rebuild_table()
+
+    def action_show_archives(self) -> None:
+        self.mode = "archives"
+        self._rebuild_table()
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#browser-filter", Input).focus()
+
+    def action_help(self) -> None:
+        self.app.push_screen(HelpScreen())
+
+    def action_refresh(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self.query_one("#browser-status", Static).update("[dim]Loading…[/]")
+        self._load_data()
+
+    def _auto_refresh(self) -> None:
+        if self._loading or self.mode != "scans":
+            return
+        # Quiet refresh only re-reads RUNNING (or unknown) scans; finished stay cached
+        self._load_data(quiet=True, running_only=True)
+
+    @work(thread=True, exclusive=True)
+    def _load_data(self, quiet: bool = False, running_only: bool = False) -> None:
+        scans = self._discover_scans(running_only=running_only, prior=self.scans if running_only else None)
+        archives = self.archives if (quiet and running_only) else self._discover_archives()
+        self.app.call_from_thread(self._apply_data, scans, archives, quiet)
+
+    def _apply_data(self, scans, archives, quiet: bool) -> None:
+        self.scans = scans
+        self.archives = archives
+        self._loading = False
+        self._rebuild_table()
+        if not quiet:
+            self.notify("Refreshed", timeout=1.5)
+
+    def _discover_scans(
+        self,
+        running_only: bool = False,
+        prior: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        results = []
+        prior_map = {s["name"]: s for s in (prior or [])}
+        try:
+            dirs = sorted(
+                [d for d in self.scans_dir.iterdir() if d.is_dir() and not d.name.startswith(".")],
+                key=lambda p: p.name,
+            )
+        except Exception:
+            return results
+
+        for scan_dir in dirs:
+            output_json = scan_dir / "output.json"
+            if not output_json.exists():
+                continue
+            name = scan_dir.name
+            if running_only and name in prior_map:
+                prev = prior_map[name]
+                if prev.get("status") in ("FINISHED", "INTERRUPTED"):
+                    # Keep cached row unless file grew
+                    try:
+                        st = output_json.stat()
+                        key = str(output_json)
+                        cached = self._summary_cache.get(key)
+                        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                            results.append(prev)
+                            continue
+                    except Exception:
+                        results.append(prev)
+                        continue
+            try:
+                status, events, vulns, findings, modified = self._scan_summary(output_json)
+            except Exception:
+                status, events, vulns, findings, modified = "UNKNOWN", 0, 0, 0, "?"
+            results.append({
+                "kind": "scan",
+                "name": name,
+                "path": scan_dir,
+                "status": status,
+                "event_count": events,
+                "vuln_count": vulns,
+                "finding_count": findings,
+                "modified": modified,
+            })
+        return results
+
+    def _scan_summary(self, output_json: Path) -> tuple:
+        """Return status, event/vuln/finding counts, modified time (cached by mtime/size)."""
+        st = output_json.stat()
+        key = str(output_json)
+        cached = self._summary_cache.get(key)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return cached[2]
+
+        modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        size = st.st_size
+        events = vulns = findings = 0
+        last_status = "UNKNOWN"
+
+        with open(output_json, "r", encoding="utf-8", errors="ignore") as f:
+            if size > 2_000_000:
+                # Large files: head + tail sample (much faster)
+                head = f.read(120_000)
+                f.seek(max(0, size - 60_000))
+                tail = f.read()
+                sample = head + "\n" + tail
+                sample_events = 0
+                for line in sample.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    t = ev.get("type", "")
+                    if t == "SCAN":
+                        data = ev.get("data_json") or ev.get("data") or {}
+                        stt = data.get("status")
+                        if stt:
+                            last_status = stt
+                    elif t == "VULNERABILITY":
+                        vulns += 1
+                        sample_events += 1
+                    elif t == "FINDING":
+                        findings += 1
+                        sample_events += 1
+                    elif t:
+                        sample_events += 1
+                scale = max(1.0, size / max(1, len(sample.encode("utf-8", errors="ignore"))))
+                events = int(sample_events * scale)
+                vulns = int(vulns * scale)
+                findings = int(findings * scale)
+            else:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    t = ev.get("type", "")
+                    if t == "SCAN":
+                        data = ev.get("data_json") or ev.get("data") or {}
+                        stt = data.get("status")
+                        if stt:
+                            last_status = stt
+                    elif t == "VULNERABILITY":
+                        vulns += 1
+                        events += 1
+                    elif t == "FINDING":
+                        findings += 1
+                        events += 1
+                    elif t:
+                        events += 1
+
+        if last_status == "RUNNING":
+            try:
+                import psutil
+                path_str = str(output_json.resolve())
+                open_found = False
+                for proc in psutil.process_iter(["pid"]):
+                    try:
+                        for of in proc.open_files():
+                            if of.path == path_str:
+                                open_found = True
+                                break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                    if open_found:
+                        break
+                if not open_found:
+                    last_status = "INTERRUPTED"
+            except Exception:
+                pass
+
+        summary = (last_status, events, vulns, findings, modified)
+        self._summary_cache[key] = (st.st_mtime, st.st_size, summary)
+        return summary
+
+    def _discover_archives(self) -> List[Dict[str, Any]]:
+        results = []
+        try:
+            files = sorted(self.scans_dir.glob("*.zip"))
+        except Exception:
+            return results
+        for archive_path in files:
+            if archive_path.name.startswith("."):
+                continue
+            stats = get_archive_stats(archive_path)
+            if not stats:
+                continue
+            size_mb = stats["size"] / (1024 * 1024)
+            size_str = f"{stats['size'] / 1024:.1f} KB" if size_mb < 1 else f"{size_mb:.1f} MB"
+            results.append({
+                "kind": "archive",
+                "name": archive_path.name[:-4],
+                "path": archive_path,
+                "status": "ARCHIVED",
+                "event_count": stats.get("event_count", 0),
+                "vuln_count": stats.get("vuln_count", 0),
+                "finding_count": stats.get("finding_count", 0),
+                "modified": stats.get("date", size_str),
+                "size": size_str,
+            })
+        return results
+
+    def _filtered_rows(self) -> List[Dict[str, Any]]:
+        src = self.scans if self.mode == "scans" else self.archives
+        q = self.filter_query.strip().lower()
+        if not q:
+            return list(src)
+        return [r for r in src if q in r["name"].lower()]
+
+    def _rebuild_table(self) -> None:
+        table = self.query_one("#browser-table", SelectableTable)
+        old = table.cursor_row
+        table.clear()
+        self.rows = self._filtered_rows()
+
+        for row in self.rows:
+            status = row.get("status", "?")
+            if status == "RUNNING":
+                st = Text("● RUNNING", style="bold green")
+            elif status == "FINISHED":
+                st = Text("✓ FINISHED", style="bold blue")
+            elif status == "INTERRUPTED":
+                st = Text("⚠ INTERRUPTED", style="bold yellow")
+            elif status == "ARCHIVED":
+                st = Text("▣ ARCHIVE", style="magenta")
+            else:
+                st = Text(str(status), style="dim")
+
+            vulns = row.get("vuln_count", 0)
+            findings = row.get("finding_count", 0)
+            vcell = Text(f"⚠ {vulns}", style="bold red") if vulns else Text(str(vulns), style="dim")
+            fcell = Text(f"⚠ {findings}", style="bold yellow") if findings else Text(str(findings), style="dim")
+
+            table.add_row(
+                Text(row["name"], no_wrap=True, overflow="ellipsis"),
+                st,
+                f"{row.get('event_count', 0):,}",
+                vcell,
+                fcell,
+                str(row.get("modified", "")),
+            )
+
+        if self.rows and old is not None and 0 <= old < len(self.rows):
+            table.move_cursor(row=old)
+
+        n = len(self.rows)
+        total = len(self.scans if self.mode == "scans" else self.archives)
+        running = sum(1 for s in self.scans if s.get("status") == "RUNNING")
+        self.query_one("#browser-status", Static).update(
+            f"[dim]{n}/{total} shown[/]  ·  [green]{running} running[/]  ·  "
+            f"Enter open · c row · Shift+C table · a archive · d delete · ? help"
+        )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "browser-filter":
+            self.filter_query = event.value or ""
+            self._rebuild_table()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-refresh":
+            self.action_refresh()
+
+    def _selected(self) -> Optional[Dict[str, Any]]:
+        table = self.query_one("#browser-table", SelectableTable)
+        if not self.rows or table.cursor_row < 0 or table.cursor_row >= len(self.rows):
+            return None
+        return self.rows[table.cursor_row]
+
+    def action_open_row(self) -> None:
+        row = self._selected()
+        if not row:
+            return
+        if row["kind"] == "scan":
+            self.app.push_screen(WorkspaceScreen(row["path"], self.app.scan_refresh_interval))
+        else:
+            self.notify("Press u to unarchive, then open the restored scan", timeout=3)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_open_row()
+
+    def action_copy_row(self) -> None:
+        """Copy highlighted browser row as TSV (or mouse selection)."""
+        selected = self.get_selected_text()
+        if selected:
+            notify_copied(self, "selection", selected)
+            return
+        table = self.query_one("#browser-table", SelectableTable)
+        text = table.export_selected_row_tsv()
+        if not text.strip():
+            # Fallback: structured path line
+            row = self._selected()
+            if row:
+                text = f"{row['name']}\t{row.get('status', '')}\t{row['path']}\n"
+        notify_copied(self, "row", text)
+
+    def action_copy_table(self) -> None:
+        """Copy entire browser table as TSV."""
+        table = self.query_one("#browser-table", SelectableTable)
+        text = table.export_all_tsv()
+        n = table.row_count
+        notify_copied(self, f"table ({n} rows)", text)
+
+    def action_archive(self) -> None:
+        if self.mode != "scans":
+            self.notify("Switch to Scans (1) to archive", severity="warning")
+            return
+        row = self._selected()
+        if not row:
+            return
+        if row.get("status") == "RUNNING":
+            self.notify("Cannot archive a running scan", severity="warning")
+            return
+
+        def done(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            ok, msg = create_archive(row["path"])
+            self.notify(msg, severity="information" if ok else "error", timeout=4)
+            self.action_refresh()
+
+        self.app.push_screen(
+            ConfirmDialog(f"Archive '{row['name']}'?\nCompresses to ZIP and removes the folder."),
+            done,
+        )
+
+    def action_unarchive(self) -> None:
+        if self.mode != "archives":
+            self.notify("Switch to Archives (2) to unarchive", severity="warning")
+            return
+        row = self._selected()
+        if not row:
+            return
+
+        def done(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            ok, msg = extract_archive(row["path"])
+            self.notify(msg, severity="information" if ok else "error", timeout=4)
+            self.mode = "scans"
+            self.action_refresh()
+
+        self.app.push_screen(
+            ConfirmDialog(f"Unarchive '{row['name']}'?\nExtracts ZIP and removes the archive."),
+            done,
+        )
+
+    def action_delete(self) -> None:
+        row = self._selected()
+        if not row:
+            return
+        if row.get("status") == "RUNNING":
+            self.notify("Cannot delete a running scan", severity="warning")
+            return
+        kind = row["kind"]
+        label = "scan folder" if kind == "scan" else "archive file"
+
+        def done(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            try:
+                if kind == "scan":
+                    shutil.rmtree(row["path"])
+                else:
+                    row["path"].unlink()
+                self.notify(f"Deleted {row['name']}", timeout=3)
+                self.action_refresh()
+            except Exception as e:
+                self.notify(f"Delete failed: {e}", severity="error", timeout=5)
+
+        self.app.push_screen(
+            ConfirmDialog(f"PERMANENTLY delete {label} '{row['name']}'?\nThis cannot be undone."),
+            done,
+        )
+
+
+# ============================================================================
+# Workspace — analyze one scan
+# ============================================================================
+
+# Ordered for a typical recon workflow:
+#   issues → asset inventory → raw feed → meta
+VIEWS = [
+    ("vulns", "1  Vulns"),
+    ("findings", "2  Findings"),
+    ("ips", "3  IPs"),
+    ("emails", "4  Emails"),
+    ("social", "5  Social"),
+    ("subs", "6  Subdomains"),
+    ("events", "7  Events"),
+    ("stats", "8  Stats"),
+    ("config", "9  Preset"),
+]
+
+# Event types for the intel menus (BBOT names)
+IP_EVENT_TYPES = frozenset({"IP_ADDRESS", "IPV4_ADDRESS", "IPV6_ADDRESS", "IP_RANGE"})
+EMAIL_EVENT_TYPES = frozenset({"EMAIL_ADDRESS"})
+SOCIAL_EVENT_TYPES = frozenset({"SOCIAL"})
+
+
+class WorkspaceScreen(Screen):
+    """Single-scan workspace: left nav · center list · right detail."""
+
+    MAX_ROWS = 750
+    SEARCH_DEBOUNCE = 0.18
+    SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+
+    BINDINGS = [
+        Binding("q", "back", "Back"),
+        Binding("escape", "back", "Back"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("slash", "focus_filter", "Filter"),
+        Binding("f", "focus_filter", "Filter", show=False),
+        Binding("c", "copy_row", "Copy row"),
+        Binding("shift+c", "copy_table", "Copy table"),
+        Binding("y", "copy_json", "JSON"),
+        Binding("t", "annotate", "Annotate"),
+        Binding("x", "mark_fp", "False+"),
+        Binding("i", "mark_risk", "Risk"),
+        Binding("question_mark", "help", "Help"),
+        Binding("tab", "next_view", "Next view", show=False),
+        Binding("shift+tab", "prev_view", "Prev view", show=False),
+        Binding("1", "view_vulns", "Vulns", show=False),
+        Binding("2", "view_findings", "Findings", show=False),
+        Binding("3", "view_ips", "IPs", show=False),
+        Binding("4", "view_emails", "Emails", show=False),
+        Binding("5", "view_social", "Social", show=False),
+        Binding("6", "view_subs", "Subs", show=False),
+        Binding("7", "view_events", "Events", show=False),
+        Binding("8", "view_stats", "Stats", show=False),
+        Binding("9", "view_config", "Config", show=False),
+    ]
+
+    current_view = reactive("vulns")
+
+    def __init__(self, scan_path: Path, refresh_interval: float = 2.0):
+        super().__init__()
+        self.scan_path = scan_path
+        self.refresh_interval = refresh_interval
+        self.scan_data = ScanData(scan_path)
+        self.item_list: List[Any] = []
+        self.filter_query = ""
+        self.status_filter = "Actionable"
+        self.type_filter = "All"
+        self._timer = None
+        self._search_timer = None
+        self._detail_index = -1
+        self._events_by_type: Optional[Dict[str, List[dict]]] = None
+        self._event_types: Optional[List[str]] = None
+        self._search_terms: List[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static("", id="ws-banner")
+        with Horizontal(id="ws-body"):
+            with Vertical(id="ws-nav"):
+                yield Static("Views", classes="pane-title")
+                yield OptionList(id="view-list")
+            with Vertical(id="ws-main"):
+                with Horizontal(id="ws-filters"):
+                    yield Input(placeholder="Search…  (/)", id="ws-search")
+                    yield Select(
+                        options=[
+                            ("⚡ Actionable", "Actionable"),
+                            ("All statuses", "All"),
+                        ] + [(v["label"], k) for k, v in STATUS_OPTIONS.items()],
+                        value="Actionable",
+                        id="ws-status-filter",
+                        allow_blank=False,
+                    )
+                    yield Select(
+                        options=[("All types", "All")],
+                        value="All",
+                        id="ws-type-filter",
+                        allow_blank=False,
+                    )
+                yield SelectableTable(id="ws-table")
+            yield DetailPane(id="ws-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._rebuild_nav()
+        # Type filter hidden until Events/Social
+        self.query_one("#ws-type-filter", Select).display = False
+
+        self._update_banner()
+        self._switch_view("vulns")
+
+        if self.scan_data.get_scan_status() == "RUNNING":
+            self._timer = self.set_interval(self.refresh_interval, self._poll)
+
+    def _intel_counts(self) -> Dict[str, int]:
+        """Count unique intel items for nav labels."""
+        self._ensure_type_index()
+        by = self._events_by_type or {}
+        ips = set()
+        for t in IP_EVENT_TYPES:
+            for ev in by.get(t, []):
+                ips.add(str(self.scan_data._get_event_data(ev)))
+        emails = set()
+        for t in EMAIL_EVENT_TYPES:
+            for ev in by.get(t, []):
+                emails.add(str(self.scan_data._get_event_data(ev)).lower())
+        social_keys = set()
+        for t in SOCIAL_EVENT_TYPES:
+            for ev in by.get(t, []):
+                data = self.scan_data._get_event_data(ev)
+                if isinstance(data, dict):
+                    social_keys.add(str(data.get("url") or f"{data.get('platform')}:{data.get('profile_name')}"))
+                else:
+                    social_keys.add(str(data))
+        vulns = len(by.get("VULNERABILITY", []))
+        findings = len(by.get("FINDING", []))
+        subs = len(self.scan_data.subdomains) if self.scan_data.has_subdomains else 0
+        return {
+            "vulns": vulns,
+            "findings": findings,
+            "ips": len(ips),
+            "emails": len(emails),
+            "social": len(social_keys),
+            "subs": subs,
+            "events": len(self.scan_data.events),
+        }
+
+    def _rebuild_nav(self) -> None:
+        """Refresh left nav labels (compact, with counts — no wrap)."""
+        ol = self.query_one("#view-list", OptionList)
+        c = self._intel_counts()
+        try:
+            ol.clear_options()
+        except Exception:
+            while ol.option_count:
+                try:
+                    ol.remove_option_at_index(0)
+                except Exception:
+                    break
+
+        # Compact single-line labels so OptionList never wraps mid-entry
+        def _cnt(n: int) -> str:
+            return f" ({n})" if n else ""
+
+        labels = {
+            "vulns": f"1  Vulns{_cnt(c['vulns'])}",
+            "findings": f"2  Findings{_cnt(c['findings'])}",
+            "ips": f"3  IPs{_cnt(c['ips'])}",
+            "emails": f"4  Emails{_cnt(c['emails'])}",
+            "social": f"5  Social{_cnt(c['social'])}",
+            "subs": f"6  Subdomains{_cnt(c['subs'])}",
+            "events": f"7  Events{_cnt(c['events'])}",
+            "stats": "8  Stats",
+            "config": "9  Preset",
+        }
+        for key, _ in VIEWS:
+            if key == "subs" and not self.scan_data.has_subdomains:
+                continue
+            ol.add_option(Option(labels.get(key, key), id=key))
+        keys = self._view_keys()
+        if self.current_view in keys:
+            try:
+                ol.highlighted = keys.index(self.current_view)
+            except Exception:
+                ol.highlighted = 0
+        else:
+            ol.highlighted = 0
+
+    def on_unmount(self) -> None:
+        if self._timer:
+            self._timer.stop()
+        if self._search_timer:
+            self._search_timer.stop()
+
+    def _invalidate_indexes(self) -> None:
+        """Drop cached type partitions after new events load."""
+        self._events_by_type = None
+        self._event_types = None
+
+    def _ensure_type_index(self) -> None:
+        if self._events_by_type is not None:
+            return
+        by_type: Dict[str, List[dict]] = {}
+        for ev in self.scan_data.events:
+            t = ev.get("type") or "UNKNOWN"
+            by_type.setdefault(t, []).append(ev)
+        self._events_by_type = by_type
+        self._event_types = sorted(by_type.keys())
+
+    def _refresh_type_filter_options(self) -> None:
+        """Populate Events type dropdown from scan data."""
+        self._ensure_type_index()
+        sel = self.query_one("#ws-type-filter", Select)
+        options = [("All types", "All")] + [(t, t) for t in (self._event_types or [])]
+        current = self.type_filter if self.type_filter in {o[1] for o in options} else "All"
+        self.type_filter = current
+        sel.set_options(options)
+        sel.value = current
+
+    def _refresh_platform_filter_options(self) -> None:
+        """Populate Social platform dropdown from SOCIAL events."""
+        self._ensure_type_index()
+        platforms = set()
+        for t in SOCIAL_EVENT_TYPES:
+            for ev in (self._events_by_type or {}).get(t, []):
+                data = self.scan_data._get_event_data(ev)
+                if isinstance(data, dict) and data.get("platform"):
+                    platforms.add(str(data.get("platform")))
+        sel = self.query_one("#ws-type-filter", Select)
+        options = [("All platforms", "All")] + [(p, p) for p in sorted(platforms)]
+        current = self.type_filter if self.type_filter in {o[1] for o in options} else "All"
+        self.type_filter = current
+        sel.set_options(options)
+        sel.value = current
+
+    def _events_of_types(self, types: frozenset) -> List[dict]:
+        self._ensure_type_index()
+        out: List[dict] = []
+        by = self._events_by_type or {}
+        for t in types:
+            out.extend(by.get(t, []))
+        return out
+
+    def _dedupe_events(self, events: List[dict], key_fn) -> List[dict]:
+        """Keep first occurrence of each key (stable order)."""
+        seen = set()
+        out = []
+        for ev in events:
+            k = key_fn(ev)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(ev)
+        return out
+
+    def _update_banner(self) -> None:
+        status = self.scan_data.get_scan_status()
+        n = len(self.scan_data.events)
+        name = escape_markup(self.scan_data.scan_name)
+        if status == "RUNNING":
+            badge = "[bold green]● RUNNING[/]"
+        elif status == "FINISHED":
+            badge = "[bold blue]✓ FINISHED[/]"
+        elif status == "INTERRUPTED":
+            badge = "[bold yellow]⚠ INTERRUPTED[/]"
+        else:
+            badge = f"[dim]{escape_markup(status)}[/]"
+        self.query_one("#ws-banner", Static).update(
+            f"[bold]{name}[/]  {badge}  ·  {n:,} events  ·  "
+            f"[dim]c row · Shift+C table · y JSON · t annotate · ? help · q back[/]"
+        )
+
+    def _poll(self) -> None:
+        if self.scan_data.check_for_updates():
+            added = self.scan_data.load_new_events()
+            if added:
+                self._invalidate_indexes()
+                self._update_banner()
+                self._rebuild_nav()
+                if self.current_view == "events":
+                    self._refresh_type_filter_options()
+                elif self.current_view == "social":
+                    self._refresh_platform_filter_options()
+                self._reload_items()
+                return
+        # Status-only check (cheap) — avoid full banner rebuild spam
+        if self.scan_data.get_scan_status() != "RUNNING" and self._timer:
+            self._timer.stop()
+            self._timer = None
+            self._update_banner()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_help(self) -> None:
+        self.app.push_screen(HelpScreen())
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#ws-search", Input).focus()
+
+    def action_refresh(self) -> None:
+        added = self.scan_data.load_new_events()
+        self.scan_data.annotation_manager.annotations = self.scan_data.annotation_manager.load()
+        self._invalidate_indexes()
+        self._update_banner()
+        self._rebuild_nav()
+        if self.current_view == "events":
+            self._refresh_type_filter_options()
+        elif self.current_view == "social":
+            self._refresh_platform_filter_options()
+        self._reload_items()
+        self.notify(f"Refreshed ({added} new events)" if added else "Refreshed", timeout=2)
+
+    def _view_keys(self) -> List[str]:
+        return [k for k, _ in VIEWS if k != "subs" or self.scan_data.has_subdomains]
+
+    def action_next_view(self) -> None:
+        keys = self._view_keys()
+        if self.current_view in keys:
+            self._switch_view(keys[(keys.index(self.current_view) + 1) % len(keys)])
+
+    def action_prev_view(self) -> None:
+        keys = self._view_keys()
+        if self.current_view in keys:
+            self._switch_view(keys[(keys.index(self.current_view) - 1) % len(keys)])
+
+    def action_view_vulns(self) -> None:
+        self._switch_view("vulns")
+
+    def action_view_findings(self) -> None:
+        self._switch_view("findings")
+
+    def action_view_ips(self) -> None:
+        self._switch_view("ips")
+
+    def action_view_emails(self) -> None:
+        self._switch_view("emails")
+
+    def action_view_social(self) -> None:
+        self._switch_view("social")
+
+    def action_view_events(self) -> None:
+        self._switch_view("events")
+
+    def action_view_stats(self) -> None:
+        self._switch_view("stats")
+
+    def action_view_subs(self) -> None:
+        if self.scan_data.has_subdomains:
+            self._switch_view("subs")
+
+    def action_view_config(self) -> None:
+        self._switch_view("config")
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "view-list" and event.option.id:
+            self._switch_view(str(event.option.id))
+
+    def _switch_view(self, view: str) -> None:
+        self.current_view = view
+        self._detail_index = -1
+        ol = self.query_one("#view-list", OptionList)
+        keys = self._view_keys()
+        if view in keys:
+            try:
+                ol.highlighted = keys.index(view)
+            except Exception:
+                pass
+
+        status_sel = self.query_one("#ws-status-filter", Select)
+        type_sel = self.query_one("#ws-type-filter", Select)
+        status_sel.display = view in ("vulns", "findings")
+        # Events: event-type filter · Social: platform filter
+        type_sel.display = view in ("events", "social")
+        if view == "events":
+            self._refresh_type_filter_options()
+        elif view == "social":
+            self._refresh_platform_filter_options()
+
+        table = self.query_one("#ws-table", SelectableTable)
+        table.clear(columns=True)
+        detail = self.query_one("#ws-detail", DetailPane)
+
+        if view == "vulns":
+            table.add_columns("Severity", "Host", "Description", "Status", "Module")
+        elif view == "findings":
+            table.add_columns("Host", "Description", "Status", "Module")
+        elif view == "ips":
+            table.add_columns("IP Address", "Module", "Scope", "Tags")
+        elif view == "emails":
+            table.add_columns("Email", "Module", "Scope", "Tags")
+        elif view == "social":
+            table.add_columns("Platform", "Profile", "URL", "Module")
+        elif view == "events":
+            table.add_columns("Type", "Data", "Module", "Scope", "Time")
+        elif view == "stats":
+            table.add_columns("Metric", "Value")
+        elif view == "subs":
+            table.add_columns("Subdomain")
+        elif view == "config":
+            table.add_columns("File")
+            detail.set_text(
+                "preset.yml",
+                self.scan_data.preset_content or "",
+                self.scan_data.preset_content or "",
+            )
+            table.add_row("preset.yml")
+            self.item_list = ["preset"]
+            return
+
+        self._reload_items()
+
+    def _matches_status(self, event: dict) -> bool:
+        if self.current_view not in ("vulns", "findings"):
+            return True
+        uuid = event.get("uuid", "")
+        ann = self.scan_data.annotation_manager.get_annotation(uuid)
+        st = ann.get("status", "new")
+        if self.status_filter == "All":
+            return True
+        if self.status_filter == "Actionable":
+            return st in ACTIONABLE_STATUSES
+        return st == self.status_filter
+
+    def _matches_type(self, event: dict) -> bool:
+        if self.type_filter in (None, "All", Select.BLANK, "False", False):
+            return True
+        # Social view reuses type_filter as platform name
+        if self.current_view == "social":
+            data = self.scan_data._get_event_data(event)
+            if isinstance(data, dict):
+                return str(data.get("platform", "")) == str(self.type_filter)
+            return False
+        return (event.get("type") or "UNKNOWN") == self.type_filter
+
+    def _matches_search(self, text: str) -> bool:
+        if not self._search_terms:
+            return True
+        low = text.lower()
+        return all(term in low for term in self._search_terms)
+
+    def _sync_search_terms(self) -> None:
+        q = self.filter_query.strip().lower()
+        self._search_terms = q.split() if q else []
+
+    def _event_summary(self, ev: dict, data: Any) -> str:
+        if isinstance(data, dict):
+            return str(
+                data.get("description")
+                or data.get("url")
+                or data.get("name")
+                or data.get("host")
+                or data
+            )[:80]
+        return str(data)[:80]
+
+    def _format_ts(self, ts: Any) -> str:
+        if not ts:
+            return ""
+        try:
+            if isinstance(ts, str) and "T" in ts:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M:%S")
+            if isinstance(ts, (int, float)):
+                return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        except Exception:
+            pass
+        return str(ts)[:10]
+
+    def _iter_typed_events(self, include_scan: bool = False):
+        """Return events optionally filtered by type dropdown (preserves scan order)."""
+        self._ensure_type_index()
+        assert self._events_by_type is not None
+        tf = self.type_filter
+        if tf not in (None, "All", Select.BLANK, "False", False):
+            return list(self._events_by_type.get(str(tf), []))
+        # Preserve original discovery order
+        if include_scan:
+            return self.scan_data.events
+        return [e for e in self.scan_data.events if e.get("type") != "SCAN"]
+
+    def _reload_items(self) -> None:
+        view = self.current_view
+        table = self.query_one("#ws-table", SelectableTable)
+        detail = self.query_one("#ws-detail", DetailPane)
+        old = table.cursor_row
+        table.clear()
+        self.item_list = []
+        self._detail_index = -1
+        self._sync_search_terms()
+        rows: List[tuple] = []
+        get_data = self.scan_data._get_event_data
+        ann_get = self.scan_data.annotation_manager.get_annotation
+        max_rows = self.MAX_ROWS
+
+        if view == "vulns":
+            self._ensure_type_index()
+            items = list((self._events_by_type or {}).get("VULNERABILITY", []))
+
+            def _sev_key(v: dict) -> int:
+                d = get_data(v)
+                if not isinstance(d, dict):
+                    return 0
+                return self.SEVERITY_RANK.get(str(d.get("severity", "")).upper(), 0)
+
+            items.sort(key=_sev_key, reverse=True)
+            for ev in items:
+                if not self._matches_status(ev):
+                    continue
+                data = get_data(ev)
+                if not isinstance(data, dict):
+                    data = {}
+                host = str(data.get("host", "") or "")
+                desc = str(data.get("description", "") or "")
+                module = str(ev.get("module", "") or "")
+                if not self._matches_search(f"{host} {desc} {module}"):
+                    continue
+                st = ann_get(ev.get("uuid", "")).get("status", "new")
+                self.item_list.append(ev)
+                rows.append((
+                    style_severity(str(data.get("severity", "UNKNOWN"))),
+                    Text(host, no_wrap=True, overflow="ellipsis"),
+                    Text(desc[:100], no_wrap=True, overflow="ellipsis"),
+                    style_annotation_label(st, STATUS_OPTIONS.get(st, STATUS_OPTIONS["new"])["label"]),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "findings":
+            self._ensure_type_index()
+            for ev in (self._events_by_type or {}).get("FINDING", []):
+                if not self._matches_status(ev):
+                    continue
+                data = get_data(ev)
+                if not isinstance(data, dict):
+                    data = {}
+                host = str(data.get("host", "") or "")
+                desc = str(data.get("description") or data.get("name") or "")
+                module = str(ev.get("module", "") or "")
+                if not self._matches_search(f"{host} {desc} {module}"):
+                    continue
+                st = ann_get(ev.get("uuid", "")).get("status", "new")
+                self.item_list.append(ev)
+                rows.append((
+                    Text(host, no_wrap=True, overflow="ellipsis"),
+                    Text(desc[:100], no_wrap=True, overflow="ellipsis"),
+                    style_annotation_label(st, STATUS_OPTIONS.get(st, STATUS_OPTIONS["new"])["label"]),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "ips":
+            items = self._dedupe_events(
+                self._events_of_types(IP_EVENT_TYPES),
+                key_fn=lambda e: str(get_data(e)),
+            )
+            items.sort(key=lambda e: str(get_data(e)))
+            for ev in items:
+                data = get_data(ev)
+                ip = str(data) if not isinstance(data, dict) else str(
+                    data.get("ip") or data.get("host") or data
+                )
+                module = str(ev.get("module", "") or "")
+                tags = ", ".join(str(t) for t in (ev.get("tags") or [])[:6])
+                if not self._matches_search(f"{ip} {module} {tags}"):
+                    continue
+                self.item_list.append(ev)
+                rows.append((
+                    Text(ip, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                    str(ev.get("scope_distance", "")),
+                    Text(tags, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "emails":
+            items = self._dedupe_events(
+                self._events_of_types(EMAIL_EVENT_TYPES),
+                key_fn=lambda e: str(get_data(e)).lower(),
+            )
+            items.sort(key=lambda e: str(get_data(e)).lower())
+            for ev in items:
+                data = get_data(ev)
+                email = str(data) if not isinstance(data, dict) else str(
+                    data.get("email") or data.get("address") or data
+                )
+                module = str(ev.get("module", "") or "")
+                tags = ", ".join(str(t) for t in (ev.get("tags") or [])[:6])
+                if not self._matches_search(f"{email} {module} {tags}"):
+                    continue
+                self.item_list.append(ev)
+                rows.append((
+                    Text(email, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                    str(ev.get("scope_distance", "")),
+                    Text(tags, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "social":
+            items = self._events_of_types(SOCIAL_EVENT_TYPES)
+            # Prefer unique by url or platform+profile
+            def _social_key(e: dict) -> str:
+                d = get_data(e)
+                if isinstance(d, dict):
+                    return str(d.get("url") or f"{d.get('platform','')}:{d.get('profile_name','')}")
+                return str(d)
+
+            items = self._dedupe_events(items, key_fn=_social_key)
+
+            def _social_sort(e: dict) -> tuple:
+                d = get_data(e)
+                if isinstance(d, dict):
+                    return (str(d.get("platform", "")), str(d.get("profile_name", "")))
+                return ("", str(d))
+
+            items.sort(key=_social_sort)
+            for ev in items:
+                if not self._matches_type(ev):
+                    continue
+                data = get_data(ev)
+                if not isinstance(data, dict):
+                    data = {"url": str(data)}
+                platform = str(data.get("platform", "") or "")
+                profile = str(data.get("profile_name", "") or "")
+                url = str(data.get("url", "") or "")
+                module = str(ev.get("module", "") or "")
+                if not self._matches_search(f"{platform} {profile} {url} {module}"):
+                    continue
+                self.item_list.append(ev)
+                rows.append((
+                    Text(platform, no_wrap=True, overflow="ellipsis"),
+                    Text(profile, no_wrap=True, overflow="ellipsis"),
+                    Text(url, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "events":
+            for ev in self._iter_typed_events(include_scan=True):
+                if not self._matches_type(ev):
+                    continue
+                data = get_data(ev)
+                summary = self._event_summary(ev, data)
+                etype = str(ev.get("type", "") or "")
+                module = str(ev.get("module", "") or "")
+                if not self._matches_search(f"{etype} {summary} {module}"):
+                    continue
+                self.item_list.append(ev)
+                rows.append((
+                    Text(etype, no_wrap=True),
+                    Text(summary, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                    str(ev.get("scope_distance", "")),
+                    self._format_ts(ev.get("timestamp", "")),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
+        elif view == "stats":
+            stats = self.scan_data.get_statistics()
+            stat_rows = [
+                ("Scan", stats["scan_name"]),
+                ("Started", stats["started_at"]),
+                ("Total events", f"{stats['total_events']:,}"),
+                ("Status", self.scan_data.get_scan_status()),
+            ]
+            ann = self.scan_data.annotation_manager.get_stats()
+            stat_rows.append(("Annotations", str(ann["total"])))
+            for st, cnt in sorted(ann.get("by_status", {}).items(), key=lambda x: -x[1]):
+                stat_rows.append((f"  status:{st}", str(cnt)))
+            stat_rows.append(("— Event types —", ""))
+            for et, cnt in sorted(stats["event_types"].items(), key=lambda x: -x[1])[:30]:
+                stat_rows.append((et, f"{cnt:,}"))
+            stat_rows.append(("— Top modules —", ""))
+            for mod, cnt in sorted(stats["modules"].items(), key=lambda x: -x[1])[:15]:
+                stat_rows.append((mod, f"{cnt:,}"))
+            self.item_list = stat_rows
+            rows = [(Text(str(a)), Text(str(b))) for a, b in stat_rows]
+            if rows:
+                table.add_rows(rows)
+            lines = [f"{a}: {b}" for a, b in stat_rows]
+            detail.set_text("Statistics", "\n".join(lines), json.dumps(stats, indent=2, default=str))
+            return
+
+        elif view == "subs":
+            for sub in self.scan_data.subdomains:
+                if not self._matches_search(sub):
+                    continue
+                self.item_list.append(sub)
+                rows.append((Text(sub),))
+            if rows:
+                table.add_rows(rows)
+            if self.item_list:
+                detail.set_text(
+                    "Subdomains",
+                    "\n".join(self.scan_data.subdomains),
+                    json.dumps(self.scan_data.subdomains, indent=2),
+                )
+            else:
+                detail.set_empty("No subdomains match filter.")
+            return
+
+        if rows:
+            table.add_rows(rows)
+
+        if self.item_list:
+            idx = old if old is not None and 0 <= old < len(self.item_list) else 0
+            table.move_cursor(row=idx)
+            self._show_detail(idx)
+        else:
+            detail.set_empty("No items in this view (try search / type / status filter).")
+
+    def _show_detail(self, index: int) -> None:
+        if index == self._detail_index and index >= 0:
+            return
+        self._detail_index = index
+        detail = self.query_one("#ws-detail", DetailPane)
+        if index < 0 or index >= len(self.item_list):
+            detail.set_empty()
+            return
+        item = self.item_list[index]
+        view = self.current_view
+
+        if view in ("vulns", "findings", "events", "ips", "emails", "social"):
+            if not isinstance(item, dict):
+                detail.set_empty()
+                return
+            plain = format_event_plain(item, self.scan_data)
+            data = self.scan_data._get_event_data(item)
+            # Richer detail headers for intel views
+            if view == "ips":
+                ip = str(data) if not isinstance(data, dict) else str(data.get("ip") or data)
+                plain = f"IP Address: {ip}\n\n" + plain
+            elif view == "emails":
+                email = str(data) if not isinstance(data, dict) else str(data.get("email") or data)
+                plain = f"Email: {email}\n\n" + plain
+            elif view == "social" and isinstance(data, dict):
+                plain = (
+                    f"Platform: {data.get('platform', '')}\n"
+                    f"Profile: {data.get('profile_name', '')}\n"
+                    f"URL: {data.get('url', '')}\n\n"
+                    + plain
+                )
+            uuid = item.get("uuid", "")
+            ann = self.scan_data.annotation_manager.get_annotation(uuid)
+            if ann:
+                plain += "\n--- Annotation ---\n"
+                plain += f"Status: {ann.get('status', '')}\n"
+                plain += f"Priority: {ann.get('priority', '')}\n"
+                plain += f"Note: {ann.get('note', '')}\n"
+            jtxt = json.dumps(item, indent=2, default=str)
+            title = f"{item.get('type', 'EVENT')}"
+            if isinstance(data, dict) and data.get("host"):
+                title += f" · {data.get('host')}"
+            elif view == "ips":
+                title = f"IP · {data if not isinstance(data, dict) else data.get('ip') or data}"
+            elif view == "emails":
+                title = f"Email · {data if not isinstance(data, dict) else data.get('email') or data}"
+            elif view == "social" and isinstance(data, dict):
+                title = f"Social · {data.get('platform', '')} · {data.get('profile_name', '')}"
+            detail.set_text(title, plain, jtxt)
+        elif view == "subs":
+            detail.set_text("Subdomain", str(item), json.dumps(item))
+        elif view == "config":
+            detail.set_text(
+                "preset.yml",
+                self.scan_data.preset_content or "",
+                self.scan_data.preset_content or "",
+            )
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == "ws-table":
+            self._show_detail(event.cursor_row)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "ws-search":
+            self.filter_query = event.value or ""
+            # Debounce reloads while typing
+            if self._search_timer:
+                self._search_timer.stop()
+            self._search_timer = self.set_timer(self.SEARCH_DEBOUNCE, self._reload_items)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "ws-status-filter":
+            self.status_filter = str(event.value)
+            self._reload_items()
+        elif event.select.id == "ws-type-filter":
+            self.type_filter = str(event.value) if event.value is not Select.BLANK else "All"
+            self._reload_items()
+
+    def _current_event(self) -> Optional[dict]:
+        if self.current_view not in ("vulns", "findings", "events", "ips", "emails", "social"):
+            return None
+        table = self.query_one("#ws-table", SelectableTable)
+        i = table.cursor_row
+        if i is None or i < 0 or i >= len(self.item_list):
+            return None
+        item = self.item_list[i]
+        return item if isinstance(item, dict) else None
+
+    def action_copy_row(self) -> None:
+        """Copy the highlighted table row as TSV (headers + row)."""
+        selected = self.get_selected_text()
+        if selected:
+            notify_copied(self, "selection", selected)
+            return
+        # Prefer TextArea selection when detail pane has focus selection
+        try:
+            detail = self.query_one("#ws-detail", DetailPane)
+            ta = detail.query_one("#detail-text", TextArea)
+            sel = ta.selected_text
+            if sel:
+                notify_copied(self, "selection", sel)
+                return
+        except Exception:
+            pass
+        table = self.query_one("#ws-table", SelectableTable)
+        text = table.export_selected_row_tsv()
+        if not text.strip():
+            # Fallback to plain details if table empty
+            detail = self.query_one("#ws-detail", DetailPane)
+            notify_copied(self, "details", detail.plain_text)
+            return
+        notify_copied(self, "row", text)
+
+    def action_copy_table(self) -> None:
+        """Copy the entire visible table (all filtered rows) as TSV."""
+        table = self.query_one("#ws-table", SelectableTable)
+        text = table.export_all_tsv()
+        n = table.row_count
+        if not text.strip():
+            notify_copied(self, "table", "")
+            return
+        notify_copied(self, f"table ({n} rows)", text)
+
+    def action_copy_json(self) -> None:
+        """Copy full JSON of the current item (or mouse selection)."""
+        selected = self.get_selected_text()
+        if selected:
+            notify_copied(self, "selection", selected)
+            return
+        detail = self.query_one("#ws-detail", DetailPane)
+        notify_copied(self, "JSON", detail.json_text or detail.plain_text)
+
+    def action_annotate(self) -> None:
+        ev = self._current_event()
+        if not ev or ev.get("type") not in ("VULNERABILITY", "FINDING"):
+            self.notify("Select a vulnerability or finding to annotate", severity="warning")
+            return
+        uuid = ev.get("uuid", "")
+        current = self.scan_data.annotation_manager.get_annotation(uuid)
+
+        def done(result: Optional[dict]) -> None:
+            if result is None:
+                return
+            if result == {}:
+                self.scan_data.annotation_manager.delete_annotation(uuid)
+                self.notify("Annotation cleared", timeout=2)
+            else:
+                self.scan_data.annotation_manager.set_annotation(
+                    uuid,
+                    status=result.get("status"),
+                    priority=result.get("priority"),
+                    note=result.get("note"),
+                )
+                self.notify("Annotation saved", timeout=2)
+            self._reload_items()
+
+        self.app.push_screen(AnnotationDialog(ev, current), done)
+
+    def action_mark_fp(self) -> None:
+        self._quick_status("false-positive")
+
+    def action_mark_risk(self) -> None:
+        self._quick_status("accepted-risk")
+
+    def _quick_status(self, status: str) -> None:
+        ev = self._current_event()
+        if not ev or ev.get("type") not in ("VULNERABILITY", "FINDING"):
+            self.notify("Select a vulnerability or finding", severity="warning")
+            return
+        uuid = ev.get("uuid", "")
+        current = self.scan_data.annotation_manager.get_annotation(uuid)
+        self.scan_data.annotation_manager.set_annotation(
+            uuid,
+            status=status,
+            priority=current.get("priority"),
+            note=current.get("note"),
+        )
+        self.notify(f"Marked {status}", timeout=2)
+        self._reload_items()
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("annotate", "mark_fp", "mark_risk"):
+            return self.current_view in ("vulns", "findings")
+        return True
+
+
+# ============================================================================
+# Application
+# ============================================================================
+
+class BBotViewer(App):
+    """BBOT TUI — browse and analyze BBOT scan results."""
+
+    ALLOW_SELECT = True
+    TITLE = "BBOT TUI"
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #browser-root, #ws-body {
+        height: 1fr;
+    }
+
+    #browser-title, #ws-banner {
+        height: auto;
+        padding: 0 1;
+        background: $boost;
+        border-bottom: solid $accent 40%;
+    }
+
+    #browser-toolbar {
+        height: auto;
+        padding: 0 1;
+        background: $panel;
+        align: left middle;
+    }
+
+    #browser-toolbar Input {
+        width: 1fr;
+        margin: 0 1;
+    }
+
+    #mode-hint {
+        width: auto;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #browser-table, #ws-table {
+        height: 1fr;
+    }
+
+    #browser-status {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
+    }
+
+    #ws-nav {
+        width: 24;
+        min-width: 22;
+        max-width: 28;
+        border-right: solid $accent 40%;
+        background: $panel;
+    }
+
+    #view-list {
+        height: 1fr;
+        padding: 0 1;
+    }
+
+    #view-list > .option-list--option {
+        padding: 0 1;
+    }
+
+    #ws-main {
+        width: 1fr;
+    }
+
+    #ws-detail {
+        width: 42%;
+        min-width: 30;
+        border-left: solid $accent 40%;
+        background: $surface;
+    }
+
+    #ws-filters {
+        height: auto;
+        padding: 0 1;
+        background: $panel;
+        align: left middle;
+    }
+
+    #ws-search {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #ws-status-filter, #ws-type-filter {
+        width: 26;
+        margin-left: 1;
+    }
+
+    .pane-title {
+        padding: 0 1;
+        background: $boost;
+        text-style: bold;
+        color: $text-muted;
+    }
+
+    #detail-text {
+        height: 1fr;
+        border: none;
+        padding: 0 1;
+    }
+
+    #dialog, #annotation-dialog, #help-dialog {
+        width: 72;
+        max-width: 100%;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: $panel;
+        border: thick $accent;
+        layout: vertical;
+    }
+
+    #dialog-message, #help-body, #annotation-title, #annotation-description {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #help-body {
+        max-height: 28;
+        overflow-y: auto;
+    }
+
+    #dialog-buttons, #annotation-buttons {
+        height: auto;
+        align: center middle;
+        margin-top: 1;
+    }
+
+    #dialog-buttons Button, #annotation-buttons Button {
+        margin: 0 1;
+    }
+
+    #annotation-dialog Select, #annotation-dialog Input {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    DataTable > .datatable--cursor {
+        background: $accent 45%;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", show=False),
+    ]
+
+    def __init__(
+        self,
+        path: Path,
+        scan_refresh_interval: float = None,
+        list_refresh_interval: float = None,
+    ):
+        super().__init__()
+        self.path = path
+        self.is_single_scan = (path / "output.json").exists()
+        self.config_file = Path.home() / ".bbot_ui_config.json"
+        config = self.load_config()
+        self.scan_refresh_interval = (
+            scan_refresh_interval
+            if scan_refresh_interval is not None
+            else config.get("scan_refresh_interval", 2.0)
+        )
+        self.list_refresh_interval = (
+            list_refresh_interval
+            if list_refresh_interval is not None
+            else config.get("list_refresh_interval", 3.0)
+        )
+        if scan_refresh_interval is not None or list_refresh_interval is not None:
+            config["scan_refresh_interval"] = self.scan_refresh_interval
+            config["list_refresh_interval"] = self.list_refresh_interval
+            self.save_config(config)
+
+    def load_config(self) -> dict:
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_config(self, config: dict) -> None:
+        try:
+            with open(self.config_file, "w") as f:
+                json.dump(config, f, indent=2)
+        except Exception:
+            pass
+
+    def watch_theme(self, theme: str) -> None:
+        config = self.load_config()
+        config["theme"] = theme
+        self.save_config(config)
+
+    def on_mount(self) -> None:
+        config = self.load_config()
+        if "theme" in config:
+            self.theme = config["theme"]
+
+        if self.is_single_scan:
+            self.title = f"BBOT — {self.path.name}"
+            self.push_screen(WorkspaceScreen(self.path, self.scan_refresh_interval))
+        else:
+            self.title = "BBOT — Scan Browser"
+            self.push_screen(BrowserScreen(self.path, self.list_refresh_interval))
+
+
+def main():
+    """Main entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="BBOT TUI - Terminal interface for browsing BBOT scan results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                    # Default ~/.bbot/scans
+  %(prog)s /path/to/scans                     # Browse scans
+  %(prog)s ~/.bbot/scans/example.com          # Open one scan
+  %(prog)s --scan-interval 5 --list-interval 10
+
+Keys: ? help · c copy · y JSON · 1/2 scans/archives · q quit
+Config: ~/.bbot_ui_config.json
+        """,
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Scan directory or parent scans dir (default: ~/.bbot/scans)",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        metavar="SECONDS",
+        help="Live refresh interval inside a scan (default: 2.0)",
+    )
+    parser.add_argument(
+        "--list-interval",
+        type=float,
+        metavar="SECONDS",
+        help="Browser refresh interval (default: 3.0)",
+    )
+    args = parser.parse_args()
+
+    if args.path:
+        path = Path(args.path).expanduser()
+    else:
+        path = Path("~/.bbot/scans").expanduser()
+        print(f"No path specified, using default: {path}")
+
+    if not path.exists():
+        print(f"Error: Path not found: {path}")
+        sys.exit(1)
+    if not path.is_dir():
+        print(f"Error: Path must be a directory: {path}")
+        sys.exit(1)
+
+    has_output_json = (path / "output.json").exists()
+    if not has_output_json:
+        scan_dirs = [
+            d for d in path.iterdir() if d.is_dir() and (d / "output.json").exists()
+        ]
+        if not scan_dirs:
+            print(f"Error: No scan directories found in {path}")
+            print("Looking for directories containing output.json files")
+            sys.exit(1)
+
+    try:
+        import psutil  # noqa: F401
+    except ImportError:
+        print("\n⚠️  WARNING: psutil is not installed in your virtual environment", file=sys.stderr)
+        print("   rm -rf ~/.bbot_ui_venv && ./bbot-ui\n", file=sys.stderr)
+        import time
+        time.sleep(2)
+
+    app = BBotViewer(
+        path,
+        scan_refresh_interval=args.scan_interval,
+        list_refresh_interval=args.list_interval,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
