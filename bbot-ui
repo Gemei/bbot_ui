@@ -128,7 +128,6 @@ from textual.widgets import (
     Select,
     OptionList,
     TextArea,
-    Rule,
 )
 from textual.widgets.option_list import Option
 from textual.binding import Binding
@@ -243,6 +242,36 @@ def create_archive(scan_path: Path) -> tuple[bool, str]:
         return (False, f"Failed to create archive: {str(e)}")
 
 
+def _safe_extract_zip(zipf: zipfile.ZipFile, dest_dir: Path) -> None:
+    """
+    Extract ZIP members under dest_dir only (Zip Slip protection).
+
+    Raises ValueError if any member would escape dest_dir.
+    """
+    dest_dir = dest_dir.resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for info in zipf.infolist():
+        # Normalize member path; reject absolute paths and traversal
+        name = info.filename.replace("\\", "/")
+        if name.startswith("/") or name.startswith("../") or "/../" in f"/{name}/":
+            raise ValueError(f"Unsafe path in archive: {info.filename}")
+
+        target = (dest_dir / name).resolve()
+        try:
+            target.relative_to(dest_dir)
+        except ValueError:
+            raise ValueError(f"Unsafe path in archive: {info.filename}") from None
+
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zipf.open(info, "r") as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+
+
 def extract_archive(archive_path: Path) -> tuple[bool, str]:
     """
     Extract a ZIP archive back to a scan folder.
@@ -255,6 +284,7 @@ def extract_archive(archive_path: Path) -> tuple[bool, str]:
         - success: True if extracted successfully, False otherwise
         - message: Error message if failed, success message if succeeded
     """
+    extract_path = None
     try:
         # Determine extraction path (remove .zip extension)
         if not archive_path.name.endswith('.zip'):
@@ -268,25 +298,27 @@ def extract_archive(archive_path: Path) -> tuple[bool, str]:
         if extract_path.exists():
             return (False, f"Directory already exists: {scan_name}. Delete or rename it first.")
 
-        # Extract archive
+        # Extract archive safely (no Zip Slip)
         with zipfile.ZipFile(archive_path, 'r') as zipf:
-            zipf.extractall(archive_path.parent)
+            # Prefer extracting into parent so internal folder name matches ZIP name
+            _safe_extract_zip(zipf, archive_path.parent)
 
         # Verify extraction by checking for output.json
         output_json = extract_path / "output.json"
         if not output_json.exists():
-            # Extraction failed or invalid scan
-            shutil.rmtree(extract_path)
+            # Some ZIPs nest under an extra folder — try single top-level dir
+            if extract_path.exists():
+                shutil.rmtree(extract_path, ignore_errors=True)
             return (False, "Invalid scan archive: output.json not found")
 
         # Try to read first line to verify it's valid
         try:
-            with open(output_json, 'r') as f:
+            with open(output_json, 'r', encoding='utf-8', errors='ignore') as f:
                 first_line = f.readline()
                 json.loads(first_line)
-        except:
+        except Exception:
             # output.json is corrupted
-            shutil.rmtree(extract_path)
+            shutil.rmtree(extract_path, ignore_errors=True)
             return (False, "Invalid scan archive: output.json is corrupted")
 
         # Extraction successful, delete archive
@@ -297,9 +329,9 @@ def extract_archive(archive_path: Path) -> tuple[bool, str]:
     except Exception as e:
         # Clean up incomplete extraction if it exists
         try:
-            if extract_path.exists():
+            if extract_path is not None and extract_path.exists():
                 shutil.rmtree(extract_path)
-        except:
+        except Exception:
             pass
         return (False, f"Failed to extract archive: {str(e)}")
 
@@ -568,15 +600,15 @@ class AnnotationManager:
             # If file is corrupted, start fresh
             return self._create_empty()
 
-    def save(self):
-        """Save annotations to file"""
+    def save(self) -> bool:
+        """Save annotations to file. Returns True on success."""
         self.annotations['updated_at'] = datetime.utcnow().isoformat() + 'Z'
         try:
             with self.annotation_file.open('w') as f:
                 json.dump(self.annotations, f, indent=2)
-        except Exception as e:
-            # Log error but don't crash
-            pass
+            return True
+        except Exception:
+            return False
 
     def get_annotation(self, uuid: str) -> dict:
         """Get annotation for event UUID"""
@@ -584,8 +616,8 @@ class AnnotationManager:
 
     def set_annotation(self, uuid: str, status: str = None,
                       priority: str = None, custom_tags: list = None,
-                      note: str = None):
-        """Set or update annotation"""
+                      note: str = None) -> bool:
+        """Set or update annotation. Returns True if saved successfully."""
         if uuid not in self.annotations['annotations']:
             self.annotations['annotations'][uuid] = {
                 'created_at': datetime.utcnow().isoformat() + 'Z'
@@ -603,13 +635,14 @@ class AnnotationManager:
             ann['note'] = note
 
         ann['updated_at'] = datetime.utcnow().isoformat() + 'Z'
-        self.save()
+        return self.save()
 
-    def delete_annotation(self, uuid: str):
-        """Remove annotation"""
+    def delete_annotation(self, uuid: str) -> bool:
+        """Remove annotation. Returns True if saved successfully."""
         if uuid in self.annotations['annotations']:
             del self.annotations['annotations'][uuid]
-            self.save()
+            return self.save()
+        return True
 
     def get_stats(self) -> dict:
         """Get annotation statistics"""
@@ -656,18 +689,20 @@ class ScanData:
         if not json_file.exists():
             return
 
-        with open(json_file, "r") as f:
-            first_event = True
+        self.events = []
+        self.scan_info = {}
+        samples_for_version: List[Dict[str, Any]] = []
+
+        with open(json_file, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     try:
                         event = json.loads(line)
 
-                        # Detect version from first event
-                        if first_event:
-                            self.bbot_version = self._detect_version(event)
-                            first_event = False
+                        # Collect a few events for version detection
+                        if len(samples_for_version) < 20:
+                            samples_for_version.append(event)
 
                         if event.get("type") == "SCAN":
                             # Keep the LAST SCAN event (overwrite previous ones)
@@ -677,10 +712,12 @@ class ScanData:
                     except json.JSONDecodeError:
                         continue
 
+        self.bbot_version = self._detect_version_from_samples(samples_for_version)
+
         # Update file position
         try:
             self.file_position = json_file.stat().st_size
-        except:
+        except Exception:
             pass
 
     def _check_file_open_psutil(self, file_path: Path) -> bool:
@@ -788,10 +825,23 @@ class ScanData:
         if not json_file.exists():
             return 0
 
+        try:
+            current_size = json_file.stat().st_size
+        except Exception:
+            return 0
+
+        # File truncated or replaced (common when scan dir is reused) → full reload
+        if current_size < self.file_position:
+            self.load_events()
+            self.load_preset()
+            self.load_subdomains()
+            # Non-zero so callers refresh UI even if event count is unchanged
+            return max(1, len(self.events))
+
         new_event_count = 0
 
         try:
-            with open(json_file, "r") as f:
+            with open(json_file, "r", encoding="utf-8", errors="ignore") as f:
                 # Seek to last known position
                 f.seek(self.file_position)
 
@@ -813,8 +863,8 @@ class ScanData:
             # Update file position
             self.file_position = json_file.stat().st_size
 
-        except Exception as e:
-            # If there's an error reading incrementally, we'll try again next time
+        except Exception:
+            # If there's an error reading incrementally, try full reload next time
             pass
 
         return new_event_count
@@ -847,18 +897,33 @@ class ScanData:
             self.has_subdomains = False
 
     def _detect_version(self, event: Dict[str, Any]) -> str:
-        """Detect BBOT version from event timestamp format"""
-        timestamp = event.get("timestamp")
+        """Detect BBOT version from a single event."""
+        # Strong signal: data_json is BBOT 3.x
+        if "data_json" in event:
+            return "3.0"
 
+        timestamp = event.get("timestamp")
         if timestamp is None:
             return "unknown"
 
         if isinstance(timestamp, (int, float)):
             return "3.0"
-        elif isinstance(timestamp, str) and "T" in timestamp:
+        if isinstance(timestamp, str) and "T" in timestamp:
             return "2.x"
-        else:
+        return "unknown"
+
+    def _detect_version_from_samples(self, samples: List[Dict[str, Any]]) -> str:
+        """Detect BBOT version from multiple events (more reliable than first line)."""
+        if not samples:
             return "unknown"
+        votes = {"3.0": 0, "2.x": 0}
+        for ev in samples:
+            v = self._detect_version(ev)
+            if v in votes:
+                votes[v] += 1
+        if votes["3.0"] == 0 and votes["2.x"] == 0:
+            return "unknown"
+        return "3.0" if votes["3.0"] >= votes["2.x"] else "2.x"
 
     def _parse_timestamp(self, timestamp):
         """Parse timestamp based on BBOT version"""
@@ -949,7 +1014,7 @@ class ScanData:
 # ============================================================================
 
 class SelectableTable(DataTable):
-    """DataTable with text selection, zebra rows, and TSV export for copy."""
+    """DataTable with text selection, zebra rows, and markdown export for copy."""
 
     ALLOW_SELECT = True
 
@@ -965,10 +1030,14 @@ class SelectableTable(DataTable):
             return ""
         if isinstance(value, Text):
             return value.plain
-        # Rich renderables / markup leftovers
         text = str(value)
-        # Collapse internal newlines so one table row = one TSV line
+        # Collapse whitespace so one logical cell stays on one line
         return " ".join(text.split())
+
+    @staticmethod
+    def _md_escape(value: str) -> str:
+        """Escape pipe characters for markdown tables."""
+        return value.replace("|", "\\|")
 
     def column_labels(self) -> List[str]:
         labels = []
@@ -987,53 +1056,70 @@ class SelectableTable(DataTable):
             return []
         return [self._cell_text(c) for c in cells]
 
-    def export_tsv(
+    def _normalize_row(self, vals: List[str], headers: List[str]) -> List[str]:
+        if not headers:
+            return vals
+        if len(vals) < len(headers):
+            return vals + [""] * (len(headers) - len(vals))
+        if len(vals) > len(headers):
+            return vals[: len(headers)]
+        return vals
+
+    def export_markdown(
         self,
         *,
         row_indices: Optional[List[int]] = None,
-        include_header: bool = True,
     ) -> str:
         """
-        Export table data as tab-separated text.
+        Export table data as a GitHub-flavored markdown table.
 
         Args:
             row_indices: Specific rows to export. None = all rows.
-            include_header: Prepend column labels.
         """
-        lines: List[str] = []
         headers = self.column_labels()
-        if include_header and headers:
-            lines.append("\t".join(headers))
-
         if row_indices is None:
             indices = list(range(self.row_count))
         else:
-            indices = row_indices
+            indices = [i for i in row_indices if 0 <= i < self.row_count]
+
+        # If there are no columns yet, nothing to export
+        if not headers and self.row_count == 0:
+            return ""
+
+        # Infer header count from first data row when labels missing
+        if not headers:
+            sample = self.row_values(indices[0]) if indices else []
+            headers = [f"Col{i+1}" for i in range(len(sample))]
+
+        lines: List[str] = []
+        header_cells = [self._md_escape(h) for h in headers]
+        lines.append("| " + " | ".join(header_cells) + " |")
+        lines.append("| " + " | ".join("---" for _ in headers) + " |")
 
         for idx in indices:
-            vals = self.row_values(idx)
-            if not vals and not headers:
-                continue
-            # Pad/truncate to header width when possible
-            if headers:
-                if len(vals) < len(headers):
-                    vals = vals + [""] * (len(headers) - len(vals))
-                elif len(vals) > len(headers):
-                    vals = vals[: len(headers)]
-            lines.append("\t".join(vals))
+            vals = self._normalize_row(self.row_values(idx), headers)
+            cells = [self._md_escape(v) for v in vals]
+            lines.append("| " + " | ".join(cells) + " |")
 
-        return "\n".join(lines).rstrip() + ("\n" if lines else "")
+        return "\n".join(lines) + "\n"
 
-    def export_selected_row_tsv(self) -> str:
-        """Export the cursor row (with header) as TSV."""
+    def export_selected_row_markdown(self) -> str:
+        """Export the cursor row as a one-row markdown table."""
         row = self.cursor_row
         if row is None or row < 0 or self.row_count == 0:
             return ""
-        return self.export_tsv(row_indices=[row], include_header=True)
+        return self.export_markdown(row_indices=[row])
+
+    def export_all_markdown(self) -> str:
+        """Export the full visible table as markdown."""
+        return self.export_markdown(row_indices=None)
+
+    # Back-compat aliases used by older call sites
+    def export_selected_row_tsv(self) -> str:
+        return self.export_selected_row_markdown()
 
     def export_all_tsv(self) -> str:
-        """Export the full visible table as TSV."""
-        return self.export_tsv(row_indices=None, include_header=True)
+        return self.export_all_markdown()
 
 
 class DetailPane(Vertical):
@@ -1046,7 +1132,7 @@ class DetailPane(Vertical):
         self._title = Static("Details", classes="pane-title")
         self._body = TextArea(
             "Select a row to view details.\n\n"
-            "Keys: c copy row · Shift+C copy table · y JSON · Ctrl+C selection",
+            "Keys: c copy row · Shift+C / C copy table (markdown) · y JSON",
             id="detail-text",
             read_only=True,
             show_line_numbers=False,
@@ -1061,7 +1147,7 @@ class DetailPane(Vertical):
         self.json_text = ""
         self._title.update("Details")
         self._body.load_text(
-            f"{message}\n\nKeys: c copy row · Shift+C copy table · y JSON · Ctrl+C selection"
+            f"{message}\n\nKeys: c copy row · Shift+C / C copy table (markdown) · y JSON"
         )
 
     def set_text(self, title: str, plain: str, json_text: str = "") -> None:
@@ -1097,10 +1183,11 @@ class HelpScreen(ModalScreen[None]):
     HELP = """BBOT TUI — Help
 
 COPYING
-  c        Copy selected table row (TSV, with headers)
-  Shift+C  Copy entire visible table (TSV)
-  y        Copy full JSON / details of current item
-  Ctrl+C   Copy mouse drag-selection (or Super+C)
+  c              Copy selected table row (markdown)
+  Shift+C / C    Copy entire visible table (markdown)
+  Ctrl+Shift+C   Same as Shift+C (if terminal blocks Shift+C)
+  y              Copy full JSON / details of current item
+  Ctrl+C         Copy mouse drag-selection (or Super+C)
   Shift+drag if the terminal captures the mouse
 
 BROWSER (scan list)
@@ -1174,8 +1261,18 @@ class ConfirmDialog(ModalScreen[bool]):
             self.dismiss(False)
             event.stop()
         elif event.key == "enter":
-            self.dismiss(True)
-            event.stop()
+            # Only confirm when Confirm is focused (not Cancel)
+            try:
+                focused = self.focused
+                if focused is not None and getattr(focused, "id", None) == "confirm":
+                    self.dismiss(True)
+                    event.stop()
+                elif focused is not None and getattr(focused, "id", None) == "cancel":
+                    self.dismiss(False)
+                    event.stop()
+            except Exception:
+                self.dismiss(True)
+                event.stop()
 
 
 class AnnotationDialog(ModalScreen[Optional[dict]]):
@@ -1265,7 +1362,8 @@ class BrowserScreen(Screen):
         Binding("u", "unarchive", "Unarchive"),
         Binding("d", "delete", "Delete"),
         Binding("c", "copy_row", "Copy row"),
-        Binding("shift+c", "copy_table", "Copy table"),
+        # Many terminals send uppercase C for Shift+C; bind both + priority
+        Binding("shift+c,C,ctrl+shift+c", "copy_table", "Copy table", priority=True),
         Binding("question_mark", "help", "Help"),
         Binding("enter", "open_row", "Open", show=False),
     ]
@@ -1320,12 +1418,16 @@ class BrowserScreen(Screen):
         self._rebuild_table()
 
     def action_show_scans(self) -> None:
+        # watch_mode rebuilds the table once
         self.mode = "scans"
-        self._rebuild_table()
 
     def action_show_archives(self) -> None:
         self.mode = "archives"
-        self._rebuild_table()
+        # Always refresh archive list when switching here (quiet path may skip it)
+        if not self._loading:
+            self._loading = True
+            self.query_one("#browser-status", Static).update("[dim]Loading archives…[/]")
+            self._load_data(quiet=True, running_only=False, archives_only=True)
 
     def action_focus_filter(self) -> None:
         self.query_one("#browser-filter", Input).focus()
@@ -1347,10 +1449,27 @@ class BrowserScreen(Screen):
         self._load_data(quiet=True, running_only=True)
 
     @work(thread=True, exclusive=True)
-    def _load_data(self, quiet: bool = False, running_only: bool = False) -> None:
-        scans = self._discover_scans(running_only=running_only, prior=self.scans if running_only else None)
-        archives = self.archives if (quiet and running_only) else self._discover_archives()
-        self.app.call_from_thread(self._apply_data, scans, archives, quiet)
+    def _load_data(
+        self,
+        quiet: bool = False,
+        running_only: bool = False,
+        archives_only: bool = False,
+    ) -> None:
+        try:
+            # Snapshot list for worker (avoid racing with main thread mutations)
+            prior = list(self.scans) if running_only else None
+            if archives_only:
+                scans = list(self.scans)
+                archives = self._discover_archives()
+            else:
+                scans = self._discover_scans(running_only=running_only, prior=prior)
+                if quiet and running_only:
+                    archives = list(self.archives)
+                else:
+                    archives = self._discover_archives()
+            self.app.call_from_thread(self._apply_data, scans, archives, quiet)
+        except Exception as e:
+            self.app.call_from_thread(self._apply_data_error, str(e))
 
     def _apply_data(self, scans, archives, quiet: bool) -> None:
         self.scans = scans
@@ -1359,6 +1478,16 @@ class BrowserScreen(Screen):
         self._rebuild_table()
         if not quiet:
             self.notify("Refreshed", timeout=1.5)
+
+    def _apply_data_error(self, message: str) -> None:
+        self._loading = False
+        try:
+            self.query_one("#browser-status", Static).update(
+                f"[red]Load failed:[/] {escape_markup(message)[:80]}"
+            )
+        except Exception:
+            pass
+        self.notify(f"Refresh failed: {message}", severity="error", timeout=4)
 
     def _discover_scans(
         self,
@@ -1395,9 +1524,9 @@ class BrowserScreen(Screen):
                         results.append(prev)
                         continue
             try:
-                status, events, vulns, findings, modified = self._scan_summary(output_json)
+                status, events, vulns, findings, modified, modified_ts = self._scan_summary(output_json)
             except Exception:
-                status, events, vulns, findings, modified = "UNKNOWN", 0, 0, 0, "?"
+                status, events, vulns, findings, modified, modified_ts = "UNKNOWN", 0, 0, 0, "?", 0.0
             results.append({
                 "kind": "scan",
                 "name": name,
@@ -1407,16 +1536,23 @@ class BrowserScreen(Screen):
                 "vuln_count": vulns,
                 "finding_count": findings,
                 "modified": modified,
+                "modified_ts": modified_ts,
             })
+        # Newest scans first
+        results.sort(key=lambda r: r.get("modified_ts") or 0, reverse=True)
         return results
 
     def _scan_summary(self, output_json: Path) -> tuple:
-        """Return status, event/vuln/finding counts, modified time (cached by mtime/size)."""
+        """Return status, counts, display date, and mtime (cached by mtime/size)."""
         st = output_json.stat()
         key = str(output_json)
         cached = self._summary_cache.get(key)
         if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-            return cached[2]
+            summary = cached[2]
+            # Older cache entries lacked mtime as 6th field
+            if isinstance(summary, tuple) and len(summary) == 5:
+                return (*summary, cached[0])
+            return summary
 
         modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
         size = st.st_size
@@ -1501,14 +1637,14 @@ class BrowserScreen(Screen):
             except Exception:
                 pass
 
-        summary = (last_status, events, vulns, findings, modified)
+        summary = (last_status, events, vulns, findings, modified, st.st_mtime)
         self._summary_cache[key] = (st.st_mtime, st.st_size, summary)
         return summary
 
     def _discover_archives(self) -> List[Dict[str, Any]]:
         results = []
         try:
-            files = sorted(self.scans_dir.glob("*.zip"))
+            files = list(self.scans_dir.glob("*.zip"))
         except Exception:
             return results
         for archive_path in files:
@@ -1519,6 +1655,10 @@ class BrowserScreen(Screen):
                 continue
             size_mb = stats["size"] / (1024 * 1024)
             size_str = f"{stats['size'] / 1024:.1f} KB" if size_mb < 1 else f"{size_mb:.1f} MB"
+            try:
+                modified_ts = archive_path.stat().st_mtime
+            except Exception:
+                modified_ts = 0.0
             results.append({
                 "kind": "archive",
                 "name": archive_path.name[:-4],
@@ -1528,8 +1668,11 @@ class BrowserScreen(Screen):
                 "vuln_count": stats.get("vuln_count", 0),
                 "finding_count": stats.get("finding_count", 0),
                 "modified": stats.get("date", size_str),
+                "modified_ts": modified_ts,
                 "size": size_str,
             })
+        # Newest archives first
+        results.sort(key=lambda r: r.get("modified_ts") or 0, reverse=True)
         return results
 
     def _filtered_rows(self) -> List[Dict[str, Any]]:
@@ -1541,11 +1684,22 @@ class BrowserScreen(Screen):
 
     def _rebuild_table(self) -> None:
         table = self.query_one("#browser-table", SelectableTable)
-        old = table.cursor_row
+        # Preserve selection by name (indices shift when sorting newest-first)
+        selected_name = None
+        try:
+            if self.rows and table.cursor_row is not None and 0 <= table.cursor_row < len(self.rows):
+                selected_name = self.rows[table.cursor_row].get("name")
+        except Exception:
+            selected_name = None
+
         table.clear()
         self.rows = self._filtered_rows()
 
-        for row in self.rows:
+        restore_idx = 0
+        for i, row in enumerate(self.rows):
+            if selected_name and row.get("name") == selected_name:
+                restore_idx = i
+
             status = row.get("status", "?")
             if status == "RUNNING":
                 st = Text("● RUNNING", style="bold green")
@@ -1572,15 +1726,15 @@ class BrowserScreen(Screen):
                 str(row.get("modified", "")),
             )
 
-        if self.rows and old is not None and 0 <= old < len(self.rows):
-            table.move_cursor(row=old)
+        if self.rows:
+            table.move_cursor(row=min(restore_idx, len(self.rows) - 1))
 
         n = len(self.rows)
         total = len(self.scans if self.mode == "scans" else self.archives)
         running = sum(1 for s in self.scans if s.get("status") == "RUNNING")
         self.query_one("#browser-status", Static).update(
             f"[dim]{n}/{total} shown[/]  ·  [green]{running} running[/]  ·  "
-            f"Enter open · c row · Shift+C table · a archive · d delete · ? help"
+            f"Enter open · c row · C/Shift+C table · a archive · d delete · ? help"
         )
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1603,7 +1757,10 @@ class BrowserScreen(Screen):
         if not row:
             return
         if row["kind"] == "scan":
-            self.app.push_screen(WorkspaceScreen(row["path"], self.app.scan_refresh_interval))
+            # Load ScanData off the UI thread (large output.json)
+            self.app.push_screen(
+                ScanLoadingScreen(row["path"], self.app.scan_refresh_interval)
+            )
         else:
             self.notify("Press u to unarchive, then open the restored scan", timeout=3)
 
@@ -1617,20 +1774,27 @@ class BrowserScreen(Screen):
             notify_copied(self, "selection", selected)
             return
         table = self.query_one("#browser-table", SelectableTable)
-        text = table.export_selected_row_tsv()
+        text = table.export_selected_row_markdown()
         if not text.strip():
-            # Fallback: structured path line
+            # Fallback: simple markdown row
             row = self._selected()
             if row:
-                text = f"{row['name']}\t{row.get('status', '')}\t{row['path']}\n"
-        notify_copied(self, "row", text)
+                text = (
+                    "| Name | Status | Path |\n"
+                    "| --- | --- | --- |\n"
+                    f"| {row['name']} | {row.get('status', '')} | {row['path']} |\n"
+                )
+        notify_copied(self, "row (markdown)", text)
 
     def action_copy_table(self) -> None:
-        """Copy entire browser table as TSV."""
+        """Copy entire browser table as a markdown table."""
         table = self.query_one("#browser-table", SelectableTable)
-        text = table.export_all_tsv()
+        text = table.export_all_markdown()
         n = table.row_count
-        notify_copied(self, f"table ({n} rows)", text)
+        if not text.strip():
+            self.notify("Nothing to copy — table is empty", severity="warning", timeout=2)
+            return
+        notify_copied(self, f"table ({n} rows, markdown)", text)
 
     def action_archive(self) -> None:
         if self.mode != "scans":
@@ -1709,6 +1873,69 @@ class BrowserScreen(Screen):
 # Workspace — analyze one scan
 # ============================================================================
 
+class ScanLoadingScreen(Screen):
+    """Load ScanData off the UI thread, then open the workspace."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("q", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, scan_path: Path, refresh_interval: float = 2.0):
+        super().__init__()
+        self.scan_path = scan_path
+        self.refresh_interval = refresh_interval
+        self._cancelled = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="loading-root"):
+            yield Static(
+                f"[bold]Loading scan[/]\n\n"
+                f"[cyan]{escape_markup(self.scan_path.name)}[/]\n\n"
+                f"[dim]Parsing output.json…[/]\n"
+                f"[dim]Press q/Esc to cancel[/]",
+                id="loading-msg",
+            )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._load_scan()
+
+    @work(thread=True, exclusive=True)
+    def _load_scan(self) -> None:
+        try:
+            data = ScanData(self.scan_path)
+            if not self._cancelled:
+                self.app.call_from_thread(self._finish_ok, data)
+        except Exception as e:
+            if not self._cancelled:
+                self.app.call_from_thread(self._finish_err, str(e))
+
+    def _finish_ok(self, data: "ScanData") -> None:
+        if self._cancelled:
+            return
+        # Replace this screen with the workspace
+        self.app.pop_screen()
+        self.app.push_screen(
+            WorkspaceScreen(
+                self.scan_path,
+                self.refresh_interval,
+                scan_data=data,
+            )
+        )
+
+    def _finish_err(self, message: str) -> None:
+        if self._cancelled:
+            return
+        self.notify(f"Failed to load scan: {message}", severity="error", timeout=5)
+        self.app.pop_screen()
+
+    def action_cancel(self) -> None:
+        self._cancelled = True
+        self.app.pop_screen()
+
+
 # Ordered for a typical recon workflow:
 #   issues → asset inventory → raw feed → meta
 VIEWS = [
@@ -1743,7 +1970,8 @@ class WorkspaceScreen(Screen):
         Binding("slash", "focus_filter", "Filter"),
         Binding("f", "focus_filter", "Filter", show=False),
         Binding("c", "copy_row", "Copy row"),
-        Binding("shift+c", "copy_table", "Copy table"),
+        # Many terminals send uppercase C for Shift+C; bind both + priority
+        Binding("shift+c,C,ctrl+shift+c", "copy_table", "Copy table", priority=True),
         Binding("y", "copy_json", "JSON"),
         Binding("t", "annotate", "Annotate"),
         Binding("x", "mark_fp", "False+"),
@@ -1764,15 +1992,23 @@ class WorkspaceScreen(Screen):
 
     current_view = reactive("vulns")
 
-    def __init__(self, scan_path: Path, refresh_interval: float = 2.0):
+    def __init__(
+        self,
+        scan_path: Path,
+        refresh_interval: float = 2.0,
+        scan_data: Optional[ScanData] = None,
+    ):
         super().__init__()
         self.scan_path = scan_path
         self.refresh_interval = refresh_interval
-        self.scan_data = ScanData(scan_path)
+        # Prefer preloaded data (from ScanLoadingScreen) to avoid UI freezes
+        self.scan_data = scan_data if scan_data is not None else ScanData(scan_path)
         self.item_list: List[Any] = []
         self.filter_query = ""
         self.status_filter = "Actionable"
-        self.type_filter = "All"
+        self.event_type_filter = "All"
+        self.platform_filter = "All"
+        self._updating_filters = False
         self._timer = None
         self._search_timer = None
         self._detail_index = -1
@@ -1881,9 +2117,8 @@ class WorkspaceScreen(Screen):
             "stats": "8  Stats",
             "config": "9  Preset",
         }
+        # Always show all views (empty Subdomains is fine)
         for key, _ in VIEWS:
-            if key == "subs" and not self.scan_data.has_subdomains:
-                continue
             ol.add_option(Option(labels.get(key, key), id=key))
         keys = self._view_keys()
         if self.current_view in keys:
@@ -1920,10 +2155,14 @@ class WorkspaceScreen(Screen):
         self._ensure_type_index()
         sel = self.query_one("#ws-type-filter", Select)
         options = [("All types", "All")] + [(t, t) for t in (self._event_types or [])]
-        current = self.type_filter if self.type_filter in {o[1] for o in options} else "All"
-        self.type_filter = current
-        sel.set_options(options)
-        sel.value = current
+        current = self.event_type_filter if self.event_type_filter in {o[1] for o in options} else "All"
+        self.event_type_filter = current
+        self._updating_filters = True
+        try:
+            sel.set_options(options)
+            sel.value = current
+        finally:
+            self._updating_filters = False
 
     def _refresh_platform_filter_options(self) -> None:
         """Populate Social platform dropdown from SOCIAL events."""
@@ -1936,10 +2175,14 @@ class WorkspaceScreen(Screen):
                     platforms.add(str(data.get("platform")))
         sel = self.query_one("#ws-type-filter", Select)
         options = [("All platforms", "All")] + [(p, p) for p in sorted(platforms)]
-        current = self.type_filter if self.type_filter in {o[1] for o in options} else "All"
-        self.type_filter = current
-        sel.set_options(options)
-        sel.value = current
+        current = self.platform_filter if self.platform_filter in {o[1] for o in options} else "All"
+        self.platform_filter = current
+        self._updating_filters = True
+        try:
+            sel.set_options(options)
+            sel.value = current
+        finally:
+            self._updating_filters = False
 
     def _events_of_types(self, types: frozenset) -> List[dict]:
         self._ensure_type_index()
@@ -1975,11 +2218,13 @@ class WorkspaceScreen(Screen):
             badge = f"[dim]{escape_markup(status)}[/]"
         self.query_one("#ws-banner", Static).update(
             f"[bold]{name}[/]  {badge}  ·  {n:,} events  ·  "
-            f"[dim]c row · Shift+C table · y JSON · t annotate · ? help · q back[/]"
+            f"[dim]c row · C/Shift+C table · y JSON · t annotate · ? help · q back[/]"
         )
 
     def _poll(self) -> None:
-        if self.scan_data.check_for_updates():
+        # Growth (check_for_updates) or shrink/reuse (file_position past EOF)
+        needs_read = self.scan_data.check_for_updates() or self._file_may_have_reset()
+        if needs_read:
             added = self.scan_data.load_new_events()
             if added:
                 self._invalidate_indexes()
@@ -1996,6 +2241,16 @@ class WorkspaceScreen(Screen):
             self._timer.stop()
             self._timer = None
             self._update_banner()
+
+    def _file_may_have_reset(self) -> bool:
+        """True if output.json shrank below last read position."""
+        try:
+            json_file = self.scan_data.scan_path / "output.json"
+            if not json_file.exists():
+                return False
+            return json_file.stat().st_size < self.scan_data.file_position
+        except Exception:
+            return False
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -2020,7 +2275,7 @@ class WorkspaceScreen(Screen):
         self.notify(f"Refreshed ({added} new events)" if added else "Refreshed", timeout=2)
 
     def _view_keys(self) -> List[str]:
-        return [k for k, _ in VIEWS if k != "subs" or self.scan_data.has_subdomains]
+        return [k for k, _ in VIEWS]
 
     def action_next_view(self) -> None:
         keys = self._view_keys()
@@ -2054,8 +2309,7 @@ class WorkspaceScreen(Screen):
         self._switch_view("stats")
 
     def action_view_subs(self) -> None:
-        if self.scan_data.has_subdomains:
-            self._switch_view("subs")
+        self._switch_view("subs")
 
     def action_view_config(self) -> None:
         self._switch_view("config")
@@ -2131,15 +2385,18 @@ class WorkspaceScreen(Screen):
         return st == self.status_filter
 
     def _matches_type(self, event: dict) -> bool:
-        if self.type_filter in (None, "All", Select.BLANK, "False", False):
-            return True
-        # Social view reuses type_filter as platform name
         if self.current_view == "social":
+            pf = self.platform_filter
+            if pf in (None, "All", Select.BLANK, False):
+                return True
             data = self.scan_data._get_event_data(event)
             if isinstance(data, dict):
-                return str(data.get("platform", "")) == str(self.type_filter)
+                return str(data.get("platform", "")) == str(pf)
             return False
-        return (event.get("type") or "UNKNOWN") == self.type_filter
+        tf = self.event_type_filter
+        if tf in (None, "All", Select.BLANK, False):
+            return True
+        return (event.get("type") or "UNKNOWN") == tf
 
     def _matches_search(self, text: str) -> bool:
         if not self._search_terms:
@@ -2178,8 +2435,8 @@ class WorkspaceScreen(Screen):
         """Return events optionally filtered by type dropdown (preserves scan order)."""
         self._ensure_type_index()
         assert self._events_by_type is not None
-        tf = self.type_filter
-        if tf not in (None, "All", Select.BLANK, "False", False):
+        tf = self.event_type_filter
+        if tf not in (None, "All", Select.BLANK, False):
             return list(self._events_by_type.get(str(tf), []))
         # Preserve original discovery order
         if include_scan:
@@ -2410,7 +2667,13 @@ class WorkspaceScreen(Screen):
                     json.dumps(self.scan_data.subdomains, indent=2),
                 )
             else:
-                detail.set_empty("No subdomains match filter.")
+                if not self.scan_data.has_subdomains:
+                    detail.set_empty(
+                        "No subdomains.txt in this scan.\n"
+                        "(Generated by BBOT subdomain-enum / similar presets.)"
+                    )
+                else:
+                    detail.set_empty("No subdomains match filter.")
             return
 
         if rows:
@@ -2494,11 +2757,17 @@ class WorkspaceScreen(Screen):
             self._search_timer = self.set_timer(self.SEARCH_DEBOUNCE, self._reload_items)
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if self._updating_filters:
+            return
         if event.select.id == "ws-status-filter":
             self.status_filter = str(event.value)
             self._reload_items()
         elif event.select.id == "ws-type-filter":
-            self.type_filter = str(event.value) if event.value is not Select.BLANK else "All"
+            val = str(event.value) if event.value is not Select.BLANK else "All"
+            if self.current_view == "social":
+                self.platform_filter = val
+            else:
+                self.event_type_filter = val
             self._reload_items()
 
     def _current_event(self) -> Optional[dict]:
@@ -2528,23 +2797,23 @@ class WorkspaceScreen(Screen):
         except Exception:
             pass
         table = self.query_one("#ws-table", SelectableTable)
-        text = table.export_selected_row_tsv()
+        text = table.export_selected_row_markdown()
         if not text.strip():
             # Fallback to plain details if table empty
             detail = self.query_one("#ws-detail", DetailPane)
             notify_copied(self, "details", detail.plain_text)
             return
-        notify_copied(self, "row", text)
+        notify_copied(self, "row (markdown)", text)
 
     def action_copy_table(self) -> None:
-        """Copy the entire visible table (all filtered rows) as TSV."""
+        """Copy the entire visible table as a markdown table."""
         table = self.query_one("#ws-table", SelectableTable)
-        text = table.export_all_tsv()
+        text = table.export_all_markdown()
         n = table.row_count
         if not text.strip():
-            notify_copied(self, "table", "")
+            self.notify("Nothing to copy — table is empty", severity="warning", timeout=2)
             return
-        notify_copied(self, f"table ({n} rows)", text)
+        notify_copied(self, f"table ({n} rows, markdown)", text)
 
     def action_copy_json(self) -> None:
         """Copy full JSON of the current item (or mouse selection)."""
@@ -2567,16 +2836,24 @@ class WorkspaceScreen(Screen):
             if result is None:
                 return
             if result == {}:
-                self.scan_data.annotation_manager.delete_annotation(uuid)
-                self.notify("Annotation cleared", timeout=2)
+                ok = self.scan_data.annotation_manager.delete_annotation(uuid)
+                self.notify(
+                    "Annotation cleared" if ok else "Failed to save annotations",
+                    severity="information" if ok else "error",
+                    timeout=3,
+                )
             else:
-                self.scan_data.annotation_manager.set_annotation(
+                ok = self.scan_data.annotation_manager.set_annotation(
                     uuid,
                     status=result.get("status"),
                     priority=result.get("priority"),
                     note=result.get("note"),
                 )
-                self.notify("Annotation saved", timeout=2)
+                self.notify(
+                    "Annotation saved" if ok else "Failed to save annotations",
+                    severity="information" if ok else "error",
+                    timeout=3,
+                )
             self._reload_items()
 
         self.app.push_screen(AnnotationDialog(ev, current), done)
@@ -2594,13 +2871,17 @@ class WorkspaceScreen(Screen):
             return
         uuid = ev.get("uuid", "")
         current = self.scan_data.annotation_manager.get_annotation(uuid)
-        self.scan_data.annotation_manager.set_annotation(
+        ok = self.scan_data.annotation_manager.set_annotation(
             uuid,
             status=status,
             priority=current.get("priority"),
             note=current.get("note"),
         )
-        self.notify(f"Marked {status}", timeout=2)
+        self.notify(
+            f"Marked {status}" if ok else "Failed to save annotations",
+            severity="information" if ok else "error",
+            timeout=3,
+        )
         self._reload_items()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
@@ -2618,13 +2899,41 @@ class BBotViewer(App):
 
     ALLOW_SELECT = True
     TITLE = "BBOT TUI"
+    # Keep command palette (ctrl+p) but strip noisy system commands below
+
+    def get_system_commands(self, screen: Screen):
+        """Command palette entries (omit Keys / Maximize / Screenshot)."""
+        from textual.app import SystemCommand
+
+        yield SystemCommand(
+            "Theme",
+            "Change the current theme",
+            self.action_change_theme,
+        )
+        yield SystemCommand(
+            "Quit",
+            "Quit the application as soon as possible",
+            self.action_quit,
+        )
+
     CSS = """
     Screen {
         background: $surface;
     }
 
-    #browser-root, #ws-body {
+    #browser-root, #ws-body, #loading-root {
         height: 1fr;
+    }
+
+    #loading-root {
+        align: center middle;
+        padding: 2;
+    }
+
+    #loading-msg {
+        text-align: center;
+        width: auto;
+        height: auto;
     }
 
     #browser-title, #ws-banner {
@@ -2820,7 +3129,8 @@ class BBotViewer(App):
 
         if self.is_single_scan:
             self.title = f"BBOT — {self.path.name}"
-            self.push_screen(WorkspaceScreen(self.path, self.scan_refresh_interval))
+            # Off-thread load so large output.json does not freeze startup
+            self.push_screen(ScanLoadingScreen(self.path, self.scan_refresh_interval))
         else:
             self.title = "BBOT — Scan Browser"
             self.push_screen(BrowserScreen(self.path, self.list_refresh_interval))

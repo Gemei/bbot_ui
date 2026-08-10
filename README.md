@@ -16,7 +16,7 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 - **Intel menus** — IPs, emails, social profiles, and subdomains
 - **Annotations** — triage vulns/findings with status, priority, and notes
 - **Archives** — ZIP compress / restore with integrity checks
-- **Copy** — selected row (`c`), full table (`Shift+C`), JSON (`y`), or mouse selection
+- **Copy** — selected row (`c`), full table as markdown (`C` / `Shift+C`), JSON (`y`), or mouse selection
 - **Live refresh** — updates while a scan is running
 - **In-app help** — press `?`
 
@@ -58,7 +58,7 @@ Settings are stored in `~/.bbot_ui_config.json`.
 | `a` | Archive scan |
 | `u` | Unarchive |
 | `d` | Delete |
-| `c` / `Shift+C` | Copy row / whole table (TSV) |
+| `c` / `C` or `Shift+C` | Copy row / whole table (markdown) |
 | `r` | Refresh |
 | `?` | Help |
 | `q` | Quit |
@@ -85,8 +85,8 @@ Three panes: **views** (left) · **table + filters** (center) · **details** (ri
 |-----|--------|
 | `Tab` | Next view |
 | `/` or `f` | Focus search |
-| `c` | Copy selected table row (TSV + headers) |
-| `Shift+C` | Copy entire visible table (TSV) |
+| `c` | Copy selected table row (markdown) |
+| `C` / `Shift+C` | Copy entire visible table (markdown) |
 | `y` | Copy JSON for current item |
 | `t` | Annotate (vulns/findings) |
 | `x` | Mark false positive |
