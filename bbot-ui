@@ -383,11 +383,10 @@ def get_archive_stats(archive_path: Path) -> dict:
                                     event_type = event.get("type", "")
                                     if event_type != "SCAN":
                                         stats['event_count'] += 1
-                                    if event_type == "VULNERABILITY":
-                                        stats['vuln_count'] += 1
-                                    elif event_type == "FINDING":
-                                        stats['finding_count'] += 1
-                                except:
+                                    vd, fd = classify_issue_counts(event)
+                                    stats['vuln_count'] += vd
+                                    stats['finding_count'] += fd
+                                except Exception:
                                     continue
                         else:
                             # For larger files, estimate based on sampling
@@ -407,11 +406,10 @@ def get_archive_stats(archive_path: Path) -> dict:
                                     event_type = event.get("type", "")
                                     if event_type != "SCAN":
                                         sample_events += 1
-                                    if event_type == "VULNERABILITY":
-                                        sample_vulns += 1
-                                    elif event_type == "FINDING":
-                                        sample_findings += 1
-                                except:
+                                    vd, fd = classify_issue_counts(event)
+                                    sample_vulns += vd
+                                    sample_findings += fd
+                                except Exception:
                                     continue
 
                             # Estimate total based on sample ratio
@@ -464,6 +462,16 @@ CUSTOM_TAGS = [
 # Actionable statuses (items that still need work/attention)
 ACTIONABLE_STATUSES = ["new", "investigating", "confirmed", "reported"]
 
+# BBOT 3.x: VULNERABILITY removed — use FINDING + severity instead.
+# Severities that map to the "Vulns" view (security issues).
+VULN_SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM", "LOW"})
+# BBOT 2.x aliases → 3.x canonical
+SEVERITY_ALIASES = {
+    "INFORMATIONAL": "INFO",
+    "MODERATE": "MEDIUM",
+}
+CONFIDENCE_LEVELS = frozenset({"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CONFIRMED"})
+
 # Severity / status visual styles for tables and badges
 SEVERITY_STYLES = {
     "CRITICAL": "bold white on dark_red",
@@ -485,10 +493,138 @@ STATUS_RICH_STYLES = {
 }
 
 
+def normalize_severity(severity: Any) -> str:
+    """Canonical severity string (handles 2.x INFORMATIONAL/MODERATE aliases)."""
+    if severity is None or severity == "":
+        return ""
+    s = str(severity).strip().upper()
+    return SEVERITY_ALIASES.get(s, s)
+
+
 def style_severity(severity: str) -> Text:
     """Return a colored severity label for DataTable cells."""
-    s = (severity or "UNKNOWN").upper()
+    s = normalize_severity(severity) or "UNKNOWN"
     return Text(s, style=SEVERITY_STYLES.get(s, "dim"))
+
+
+def get_event_payload(event: Dict[str, Any]) -> Any:
+    """
+    Version-agnostic event payload.
+
+    BBOT 3.x puts dict-backed events in ``data_json`` (URL, FINDING, SCAN, …)
+    and string events in ``data``. BBOT 2.x always used ``data`` (string or dict).
+    Prefer ``data_json`` whenever present so mixed/legacy files still work.
+    """
+    if event.get("data_json") is not None:
+        return event["data_json"]
+    return event.get("data", {})
+
+
+def event_url(event: Dict[str, Any], data: Any = None) -> str:
+    """Extract URL string from 2.x string data or 3.x data_json dict."""
+    if data is None:
+        data = get_event_payload(event)
+    if isinstance(data, dict):
+        return str(data.get("url") or "")
+    if event.get("type") in ("URL", "URL_UNVERIFIED", "HTTP_RESPONSE", "STORAGE_BUCKET"):
+        return str(data or "")
+    return ""
+
+
+def event_pretty(event: Dict[str, Any], data: Any = None) -> str:
+    """Human-readable summary for tables (2.x + 3.x)."""
+    if data is None:
+        data = get_event_payload(event)
+    etype = event.get("type", "")
+    if isinstance(data, dict):
+        return str(
+            data.get("description")
+            or data.get("name")
+            or data.get("url")
+            or data.get("host")
+            or data.get("profile_name")
+            or data
+        )
+    return str(data)
+
+
+def is_vulnerability_event(event: Dict[str, Any]) -> bool:
+    """
+    True for security issues shown in the Vulns view.
+
+    - BBOT 2.x: type == VULNERABILITY
+    - BBOT 3.x: type == FINDING with severity CRITICAL|HIGH|MEDIUM|LOW
+    """
+    etype = event.get("type", "")
+    if etype == "VULNERABILITY":
+        return True
+    if etype == "FINDING":
+        data = get_event_payload(event)
+        if isinstance(data, dict):
+            sev = normalize_severity(data.get("severity"))
+            return sev in VULN_SEVERITIES
+    return False
+
+
+def is_finding_event(event: Dict[str, Any]) -> bool:
+    """
+    True for informational FINDING events (Findings view).
+
+    - BBOT 2.x: type == FINDING (no severity / not a vuln)
+    - BBOT 3.x: type == FINDING with severity INFO (or empty)
+    Excludes events already classified as vulnerabilities.
+    """
+    if event.get("type") != "FINDING":
+        return False
+    return not is_vulnerability_event(event)
+
+
+def is_in_scope_event(event: Dict[str, Any]) -> bool:
+    """
+    True when the event is in scope for the scanned target.
+
+    Prefer explicit tags / scope_distance (BBOT 2.x + 3.x):
+    - in-scope tag or scope_distance == 0 → in scope
+    - affiliate / distance-* tags or scope_distance > 0 → out of scope
+    """
+    tags = {str(t).lower() for t in (event.get("tags") or [])}
+    if "affiliate" in tags or any(t.startswith("distance-") for t in tags):
+        return False
+    if "in-scope" in tags:
+        return True
+
+    desc = str(event.get("scope_description") or "").lower()
+    if desc == "in-scope":
+        return True
+    if "affiliate" in desc or desc.startswith("distance"):
+        return False
+
+    dist = event.get("scope_distance")
+    if dist is not None:
+        try:
+            return int(dist) == 0
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _host_under_roots(hostname: str, roots: set) -> bool:
+    """True if hostname equals or is a subdomain of any root domain."""
+    host = hostname.strip().lower().rstrip(".")
+    if not host or not roots:
+        return False
+    if host in roots:
+        return True
+    return any(host.endswith("." + root) for root in roots)
+
+
+def classify_issue_counts(event: Dict[str, Any]) -> tuple:
+    """Return (vuln_delta, finding_delta) for browser/archive counters."""
+    if is_vulnerability_event(event):
+        return (1, 0)
+    if is_finding_event(event):
+        return (0, 1)
+    return (0, 0)
 
 
 def style_annotation_label(status_key: str, label: str) -> Text:
@@ -505,34 +641,49 @@ def format_event_plain(event: Dict[str, Any], scan_data: Optional["ScanData"] = 
     if scan_data:
         data = scan_data._get_event_data(event)
     else:
-        data = event.get("data_json") or event.get("data", {})
+        data = get_event_payload(event)
 
     lines = [event_type, ""]
-    if event_type == "VULNERABILITY" and isinstance(data, dict):
-        lines.append(f"Severity: {data.get('severity', 'UNKNOWN')}")
-        lines.append("")
     if isinstance(data, dict):
+        sev = normalize_severity(data.get("severity"))
+        if event_type in ("VULNERABILITY", "FINDING") and sev:
+            lines.append(f"Severity: {sev}")
+        if data.get("confidence"):
+            lines.append(f"Confidence: {data.get('confidence')}")
+        if data.get("name"):
+            lines.append(f"Name: {data.get('name')}")
+        if sev or data.get("confidence") or data.get("name"):
+            lines.append("")
+
         host = data.get("host", event.get("host", "N/A"))
         lines.append(f"Host: {host}")
-        if data.get("url"):
-            lines.append(f"URL: {data.get('url')}")
+        url = data.get("url") or event_url(event, data)
+        if url:
+            lines.append(f"URL: {url}")
         lines.append("")
         if data.get("description"):
             lines.append("Description:")
             lines.append(str(data.get("description")))
             lines.append("")
-        # Remaining key fields
-        for key in ("name", "severity", "path", "title"):
-            if key in data and key not in ("severity",) and data[key] not in (None, ""):
-                if key == "name":
-                    lines.append(f"Name: {data[key]}")
+        for key in ("path", "title", "platform", "profile_name", "status_code", "http_title"):
+            if data.get(key) not in (None, ""):
+                lines.append(f"{key}: {data[key]}")
     else:
+        # 2.x string URL / simple events
+        url = event_url(event, data)
+        if url:
+            lines.append(f"URL: {url}")
         lines.append(f"Data: {data}")
         lines.append("")
+
+    if event.get("host") and (not isinstance(data, dict) or not data.get("host")):
+        lines.append(f"Host: {event.get('host')}")
 
     lines.append(f"Module: {event.get('module', 'N/A')}")
     if event.get("module_sequence"):
         lines.append(f"Module Sequence: {event.get('module_sequence')}")
+    if event.get("uuid"):
+        lines.append(f"UUID: {event.get('uuid')}")
     if event.get("discovery_context"):
         lines.append("")
         lines.append("Discovery Context:")
@@ -543,6 +694,12 @@ def format_event_plain(event: Dict[str, Any], scan_data: Optional["ScanData"] = 
         lines.append("Discovery Path:")
         for i, step in enumerate(discovery_path, 1):
             lines.append(f"{i}. {step}")
+    host_meta = event.get("host_metadata")
+    if isinstance(host_meta, dict) and host_meta:
+        lines.append("")
+        lines.append("Host metadata:")
+        for k, v in host_meta.items():
+            lines.append(f"  {k}: {v}")
     tags = event.get("tags") or []
     if tags:
         lines.append("")
@@ -568,6 +725,47 @@ def notify_copied(screen: Screen, label: str, text: str) -> None:
     if len(preview) > 72:
         preview = preview[:72] + "…"
     screen.notify(f"Copied {label}: {preview}", title="Clipboard", timeout=2)
+
+
+def unicode_bar(value: float, maximum: float, width: int = 28) -> str:
+    """Horizontal bar using block characters (works in any terminal)."""
+    if maximum <= 0 or value <= 0:
+        return "░" * width
+    ratio = min(1.0, float(value) / float(maximum))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_bar_chart(
+    title: str,
+    items: List[tuple],
+    *,
+    width: int = 32,
+    limit: int = 15,
+) -> str:
+    """
+    Build a labeled horizontal bar chart.
+
+    items: list of (label, count) sorted as desired.
+    """
+    if not items:
+        return f"{title}\n  (no data)\n"
+    sliced = items[:limit]
+    max_val = max(float(c) for _, c in sliced) if sliced else 1.0
+    total = sum(float(c) for _, c in items) or 1.0
+    label_w = min(24, max((len(str(lab)) for lab, _ in sliced), default=8))
+    lines = [title, ""]
+    for lab, cnt in sliced:
+        lab_s = str(lab)
+        if len(lab_s) > label_w:
+            lab_s = lab_s[: label_w - 1] + "…"
+        pct = (float(cnt) / total) * 100.0
+        bar = unicode_bar(float(cnt), max_val, width=width)
+        lines.append(f"  {lab_s:<{label_w}}  {bar}  {int(cnt):>6,}  ({pct:5.1f}%)")
+    if len(items) > limit:
+        lines.append(f"  … and {len(items) - limit} more")
+    lines.append("")
+    return "\n".join(lines)
 
 
 class AnnotationManager:
@@ -954,32 +1152,104 @@ class ScanData:
                 return datetime.now()
 
     def _get_event_data(self, event: Dict[str, Any]) -> Any:
-        """Extract event data based on BBOT version (works for all event types)
-
-        Returns the data value which can be:
-        - A dict (for complex events like VULNERABILITY, FINDING, SCAN)
-        - A string or other simple value (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
-        """
-        if self.bbot_version == "3.0":
-            # BBOT 3.0: Try data_json first (for VULNERABILITY, FINDING, SCAN)
-            # Fall back to data (for simple events like DNS_NAME, URL, OPEN_TCP_PORT)
-            if "data_json" in event:
-                return event.get("data_json", {})
-            else:
-                return event.get("data", {})
-        else:
-            # BBOT 2.x: Always use data
-            return event.get("data", {})
+        """Extract event payload (BBOT 2.x ``data`` or 3.x ``data_json``)."""
+        return get_event_payload(event)
 
     def _get_scan_data(self, scan_event: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract scan data based on BBOT version (alias for _get_event_data for backward compatibility)"""
-        return self._get_event_data(scan_event)
+        """Extract scan data (alias for _get_event_data)."""
+        data = self._get_event_data(scan_event)
+        return data if isinstance(data, dict) else {}
+
+    def iter_vulnerability_events(self) -> List[Dict[str, Any]]:
+        """Vulns view: 2.x VULNERABILITY + 3.x FINDING with vuln severities."""
+        return [e for e in self.events if is_vulnerability_event(e)]
+
+    def iter_finding_events(self) -> List[Dict[str, Any]]:
+        """Findings view: informational FINDING events (not vuln-severity)."""
+        return [e for e in self.events if is_finding_event(e)]
+
+    def _dns_event_hostname(self, ev: Dict[str, Any]) -> str:
+        data = self._get_event_data(ev)
+        name = str(
+            data if not isinstance(data, dict) else (data.get("host") or data.get("name") or "")
+        ).strip().lower().rstrip(".")
+        if not name:
+            name = str(ev.get("host") or "").strip().lower().rstrip(".")
+        return name
+
+    def iter_subdomain_events(self) -> List[Dict[str, Any]]:
+        """
+        Subdomains view: in-scope DNS_NAME / DNS_NAME_UNRESOLVED only
+        (excludes affiliates / scope_distance > 0), plus in-scope names from
+        subdomains.txt that lack a matching event.
+        """
+        by_name: Dict[str, Dict[str, Any]] = {}
+        in_scope_roots: set = set()
+
+        for ev in self.events:
+            if ev.get("type") not in DNS_NAME_EVENT_TYPES:
+                continue
+            if not is_in_scope_event(ev):
+                continue
+            name = self._dns_event_hostname(ev)
+            if not name:
+                continue
+
+            tags = {str(t).lower() for t in (ev.get("tags") or [])}
+            # Apex / seed hosts define which trees belong to the scanned target
+            if "domain" in tags or "target" in tags or "seed" in tags:
+                in_scope_roots.add(name)
+            else:
+                # Also treat bare registered domains (two labels) as roots
+                if name.count(".") == 1:
+                    in_scope_roots.add(name)
+
+            # Prefer resolved DNS_NAME over UNRESOLVED when both exist
+            prev = by_name.get(name)
+            if prev is None or (
+                prev.get("type") == "DNS_NAME_UNRESOLVED" and ev.get("type") == "DNS_NAME"
+            ):
+                by_name[name] = ev
+
+        # If we never tagged an apex, derive roots from discovered in-scope names
+        if not in_scope_roots and by_name:
+            for host in by_name:
+                parts = host.split(".")
+                if len(parts) >= 2:
+                    in_scope_roots.add(".".join(parts[-2:]))
+
+        for sub in self.subdomains:
+            key = sub.strip().lower().rstrip(".")
+            if not key or key in by_name:
+                continue
+            # Only keep txt entries under the in-scope target tree
+            if in_scope_roots and not _host_under_roots(key, in_scope_roots):
+                continue
+            if not in_scope_roots:
+                # No DNS scope signal — trust subdomains.txt (BBOT writes in-scope names)
+                pass
+            by_name[key] = {
+                "type": "DNS_NAME",
+                "data": sub.strip(),
+                "host": sub.strip(),
+                "module": "subdomains.txt",
+                "tags": ["from-subdomains-txt", "in-scope"],
+                "scope_distance": 0,
+                "scope_description": "in-scope",
+                "discovery_context": "Listed in subdomains.txt (no matching DNS_NAME event in output.json)",
+            }
+
+        return sorted(
+            by_name.values(),
+            key=lambda e: self._dns_event_hostname(e),
+        )
 
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate statistics from events"""
         event_types = {}
         modules = {}
         scope_distances = {}
+        severities = {}
 
         for event in self.events:
             event_type = event.get("type", "UNKNOWN")
@@ -990,12 +1260,18 @@ class ScanData:
             modules[module] = modules.get(module, 0) + 1
             scope_distances[scope_dist] = scope_distances.get(scope_dist, 0) + 1
 
+            if is_vulnerability_event(event) or is_finding_event(event):
+                data = self._get_event_data(event)
+                if isinstance(data, dict):
+                    sev = normalize_severity(data.get("severity")) or "INFO"
+                    severities[sev] = severities.get(sev, 0) + 1
+
         # Get started_at and format it for display
         started_at_raw = self._get_scan_data(self.scan_info).get("started_at", "Unknown")
         if started_at_raw != "Unknown":
             try:
                 started_at = self._parse_timestamp(started_at_raw).strftime("%Y-%m-%d %H:%M:%S")
-            except:
+            except Exception:
                 started_at = str(started_at_raw)
         else:
             started_at = "Unknown"
@@ -1005,9 +1281,77 @@ class ScanData:
             "event_types": event_types,
             "modules": modules,
             "scope_distances": scope_distances,
+            "severities": severities,
+            "vuln_count": len(self.iter_vulnerability_events()),
+            "finding_count": len(self.iter_finding_events()),
             "scan_name": self.scan_name,
             "started_at": started_at,
+            "status": self.get_scan_status(),
+            "bbot_version": self.bbot_version,
         }
+
+    def build_stats_report(self) -> str:
+        """Full text report with unicode bar charts for the Stats detail pane."""
+        stats = self.get_statistics()
+        ann = self.annotation_manager.get_stats()
+        total = stats["total_events"] or 1
+
+        lines = [
+            f"Scan: {stats['scan_name']}",
+            f"Started: {stats['started_at']}",
+            f"Status: {stats['status']}  ·  BBOT schema: {stats['bbot_version']}",
+            f"Total events: {stats['total_events']:,}",
+            f"Vulns: {stats['vuln_count']:,}  ·  Findings: {stats['finding_count']:,}",
+            f"Annotations: {ann['total']:,}",
+            "",
+        ]
+
+        type_items = sorted(stats["event_types"].items(), key=lambda x: -x[1])
+        lines.append(format_bar_chart("Event types", type_items, width=34, limit=20))
+
+        mod_items = sorted(stats["modules"].items(), key=lambda x: -x[1])
+        lines.append(format_bar_chart("Top modules", mod_items, width=34, limit=15))
+
+        scope_items = sorted(
+            ((str(k), v) for k, v in stats["scope_distances"].items()),
+            key=lambda x: int(x[0]) if str(x[0]).lstrip("-").isdigit() else 999,
+        )
+        lines.append(format_bar_chart("Scope distance", scope_items, width=34, limit=12))
+
+        sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]
+        sev_items = [
+            (s, stats["severities"][s])
+            for s in sev_order
+            if s in stats["severities"]
+        ]
+        for s, c in sorted(stats["severities"].items(), key=lambda x: -x[1]):
+            if s not in sev_order:
+                sev_items.append((s, c))
+        if sev_items:
+            lines.append(format_bar_chart("Issue severity (vulns + findings)", sev_items, width=34, limit=10))
+
+        if ann["by_status"]:
+            st_items = sorted(ann["by_status"].items(), key=lambda x: -x[1])
+            lines.append(format_bar_chart("Annotation status", st_items, width=34, limit=10))
+        if ann.get("by_priority"):
+            pr_items = sorted(ann["by_priority"].items(), key=lambda x: -x[1])
+            lines.append(format_bar_chart("Annotation priority", pr_items, width=34, limit=8))
+
+        # Compact sparkline of top event-type volumes
+        if type_items:
+            vals = [float(c) for _, c in type_items[:24]]
+            mx = max(vals) or 1.0
+            spark_chars = "▁▂▃▄▅▆▇█"
+            spark = "".join(
+                spark_chars[min(len(spark_chars) - 1, int((v / mx) * (len(spark_chars) - 1)))]
+                for v in vals
+            )
+            lines.append("Event-type sparkline (top types):")
+            lines.append(f"  {spark}")
+            lines.append("")
+
+        _ = total  # reserved for future % footnotes
+        return "\n".join(lines).rstrip() + "\n"
 
 # ============================================================================
 # Shared table / detail widgets
@@ -1577,18 +1921,16 @@ class BrowserScreen(Screen):
                         continue
                     t = ev.get("type", "")
                     if t == "SCAN":
-                        data = ev.get("data_json") or ev.get("data") or {}
-                        stt = data.get("status")
-                        if stt:
-                            last_status = stt
-                    elif t == "VULNERABILITY":
-                        vulns += 1
-                        sample_events += 1
-                    elif t == "FINDING":
-                        findings += 1
-                        sample_events += 1
+                        data = get_event_payload(ev)
+                        if isinstance(data, dict):
+                            stt = data.get("status")
+                            if stt:
+                                last_status = stt
                     elif t:
                         sample_events += 1
+                        vd, fd = classify_issue_counts(ev)
+                        vulns += vd
+                        findings += fd
                 scale = max(1.0, size / max(1, len(sample.encode("utf-8", errors="ignore"))))
                 events = int(sample_events * scale)
                 vulns = int(vulns * scale)
@@ -1604,18 +1946,16 @@ class BrowserScreen(Screen):
                         continue
                     t = ev.get("type", "")
                     if t == "SCAN":
-                        data = ev.get("data_json") or ev.get("data") or {}
-                        stt = data.get("status")
-                        if stt:
-                            last_status = stt
-                    elif t == "VULNERABILITY":
-                        vulns += 1
-                        events += 1
-                    elif t == "FINDING":
-                        findings += 1
-                        events += 1
+                        data = get_event_payload(ev)
+                        if isinstance(data, dict):
+                            stt = data.get("status")
+                            if stt:
+                                last_status = stt
                     elif t:
                         events += 1
+                        vd, fd = classify_issue_counts(ev)
+                        vulns += vd
+                        findings += fd
 
         if last_status == "RUNNING":
             try:
@@ -1954,6 +2294,7 @@ VIEWS = [
 IP_EVENT_TYPES = frozenset({"IP_ADDRESS", "IPV4_ADDRESS", "IPV6_ADDRESS", "IP_RANGE"})
 EMAIL_EVENT_TYPES = frozenset({"EMAIL_ADDRESS"})
 SOCIAL_EVENT_TYPES = frozenset({"SOCIAL"})
+DNS_NAME_EVENT_TYPES = frozenset({"DNS_NAME", "DNS_NAME_UNRESOLVED"})
 
 
 class WorkspaceScreen(Screen):
@@ -1961,7 +2302,14 @@ class WorkspaceScreen(Screen):
 
     MAX_ROWS = 750
     SEARCH_DEBOUNCE = 0.18
-    SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+    SEVERITY_RANK = {
+        "CRITICAL": 5,
+        "HIGH": 4,
+        "MEDIUM": 3,
+        "LOW": 2,
+        "INFO": 1,
+        "UNKNOWN": 0,
+    }
 
     BINDINGS = [
         Binding("q", "back", "Back"),
@@ -2015,6 +2363,8 @@ class WorkspaceScreen(Screen):
         self._events_by_type: Optional[Dict[str, List[dict]]] = None
         self._event_types: Optional[List[str]] = None
         self._search_terms: List[str] = []
+        self._stats_report = ""
+        self._stats_json = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2076,9 +2426,9 @@ class WorkspaceScreen(Screen):
                     social_keys.add(str(data.get("url") or f"{data.get('platform')}:{data.get('profile_name')}"))
                 else:
                     social_keys.add(str(data))
-        vulns = len(by.get("VULNERABILITY", []))
-        findings = len(by.get("FINDING", []))
-        subs = len(self.scan_data.subdomains) if self.scan_data.has_subdomains else 0
+        vulns = len(self.scan_data.iter_vulnerability_events())
+        findings = len(self.scan_data.iter_finding_events())
+        subs = len(self.scan_data.iter_subdomain_events())
         return {
             "vulns": vulns,
             "findings": findings,
@@ -2344,9 +2694,9 @@ class WorkspaceScreen(Screen):
         detail = self.query_one("#ws-detail", DetailPane)
 
         if view == "vulns":
-            table.add_columns("Severity", "Host", "Description", "Status", "Module")
+            table.add_columns("Severity", "Host", "Name", "Confidence", "Status", "Module")
         elif view == "findings":
-            table.add_columns("Host", "Description", "Status", "Module")
+            table.add_columns("Severity", "Host", "Name", "Confidence", "Status", "Module")
         elif view == "ips":
             table.add_columns("IP Address", "Module", "Scope", "Tags")
         elif view == "emails":
@@ -2356,9 +2706,9 @@ class WorkspaceScreen(Screen):
         elif view == "events":
             table.add_columns("Type", "Data", "Module", "Scope", "Time")
         elif view == "stats":
-            table.add_columns("Metric", "Value")
+            table.add_columns("Metric", "Count", "%", "Graph")
         elif view == "subs":
-            table.add_columns("Subdomain")
+            table.add_columns("Subdomain", "Module", "Scope", "Tags", "Resolved")
         elif view == "config":
             table.add_columns("File")
             detail.set_text(
@@ -2409,15 +2759,7 @@ class WorkspaceScreen(Screen):
         self._search_terms = q.split() if q else []
 
     def _event_summary(self, ev: dict, data: Any) -> str:
-        if isinstance(data, dict):
-            return str(
-                data.get("description")
-                or data.get("url")
-                or data.get("name")
-                or data.get("host")
-                or data
-            )[:80]
-        return str(data)[:80]
+        return event_pretty(ev, data)[:80]
 
     def _format_ts(self, ts: Any) -> str:
         if not ts:
@@ -2458,14 +2800,13 @@ class WorkspaceScreen(Screen):
         max_rows = self.MAX_ROWS
 
         if view == "vulns":
-            self._ensure_type_index()
-            items = list((self._events_by_type or {}).get("VULNERABILITY", []))
+            items = self.scan_data.iter_vulnerability_events()
 
             def _sev_key(v: dict) -> int:
                 d = get_data(v)
                 if not isinstance(d, dict):
                     return 0
-                return self.SEVERITY_RANK.get(str(d.get("severity", "")).upper(), 0)
+                return self.SEVERITY_RANK.get(normalize_severity(d.get("severity")), 0)
 
             items.sort(key=_sev_key, reverse=True)
             for ev in items:
@@ -2474,17 +2815,20 @@ class WorkspaceScreen(Screen):
                 data = get_data(ev)
                 if not isinstance(data, dict):
                     data = {}
-                host = str(data.get("host", "") or "")
-                desc = str(data.get("description", "") or "")
+                host = str(data.get("host") or ev.get("host") or "")
+                name = str(data.get("name") or "")
+                desc = str(data.get("description") or "")
+                conf = str(data.get("confidence") or "")
                 module = str(ev.get("module", "") or "")
-                if not self._matches_search(f"{host} {desc} {module}"):
+                if not self._matches_search(f"{host} {name} {desc} {module} {conf}"):
                     continue
                 st = ann_get(ev.get("uuid", "")).get("status", "new")
                 self.item_list.append(ev)
                 rows.append((
-                    style_severity(str(data.get("severity", "UNKNOWN"))),
+                    style_severity(data.get("severity", "UNKNOWN")),
                     Text(host, no_wrap=True, overflow="ellipsis"),
-                    Text(desc[:100], no_wrap=True, overflow="ellipsis"),
+                    Text((name or desc)[:100], no_wrap=True, overflow="ellipsis"),
+                    Text(conf, no_wrap=True, overflow="ellipsis"),
                     style_annotation_label(st, STATUS_OPTIONS.get(st, STATUS_OPTIONS["new"])["label"]),
                     Text(module, no_wrap=True, overflow="ellipsis"),
                 ))
@@ -2492,23 +2836,27 @@ class WorkspaceScreen(Screen):
                     break
 
         elif view == "findings":
-            self._ensure_type_index()
-            for ev in (self._events_by_type or {}).get("FINDING", []):
+            for ev in self.scan_data.iter_finding_events():
                 if not self._matches_status(ev):
                     continue
                 data = get_data(ev)
                 if not isinstance(data, dict):
                     data = {}
-                host = str(data.get("host", "") or "")
-                desc = str(data.get("description") or data.get("name") or "")
+                host = str(data.get("host") or ev.get("host") or "")
+                name = str(data.get("name") or "")
+                desc = str(data.get("description") or "")
+                conf = str(data.get("confidence") or "")
+                sev = normalize_severity(data.get("severity")) or "INFO"
                 module = str(ev.get("module", "") or "")
-                if not self._matches_search(f"{host} {desc} {module}"):
+                if not self._matches_search(f"{host} {name} {desc} {module} {sev}"):
                     continue
                 st = ann_get(ev.get("uuid", "")).get("status", "new")
                 self.item_list.append(ev)
                 rows.append((
+                    style_severity(sev),
                     Text(host, no_wrap=True, overflow="ellipsis"),
-                    Text(desc[:100], no_wrap=True, overflow="ellipsis"),
+                    Text((name or desc)[:100], no_wrap=True, overflow="ellipsis"),
+                    Text(conf, no_wrap=True, overflow="ellipsis"),
                     style_annotation_label(st, STATUS_OPTIONS.get(st, STATUS_OPTIONS["new"])["label"]),
                     Text(module, no_wrap=True, overflow="ellipsis"),
                 ))
@@ -2628,53 +2976,119 @@ class WorkspaceScreen(Screen):
 
         elif view == "stats":
             stats = self.scan_data.get_statistics()
-            stat_rows = [
-                ("Scan", stats["scan_name"]),
-                ("Started", stats["started_at"]),
-                ("Total events", f"{stats['total_events']:,}"),
-                ("Status", self.scan_data.get_scan_status()),
-            ]
             ann = self.scan_data.annotation_manager.get_stats()
-            stat_rows.append(("Annotations", str(ann["total"])))
-            for st, cnt in sorted(ann.get("by_status", {}).items(), key=lambda x: -x[1]):
-                stat_rows.append((f"  status:{st}", str(cnt)))
-            stat_rows.append(("— Event types —", ""))
-            for et, cnt in sorted(stats["event_types"].items(), key=lambda x: -x[1])[:30]:
-                stat_rows.append((et, f"{cnt:,}"))
-            stat_rows.append(("— Top modules —", ""))
-            for mod, cnt in sorted(stats["modules"].items(), key=lambda x: -x[1])[:15]:
-                stat_rows.append((mod, f"{cnt:,}"))
-            self.item_list = stat_rows
-            rows = [(Text(str(a)), Text(str(b))) for a, b in stat_rows]
+            total = stats["total_events"] or 1
+            report = self.scan_data.build_stats_report()
+            self._stats_report = report
+            self._stats_json = json.dumps(stats, indent=2, default=str)
+
+            def _row(label: str, count: int, max_for_bar: int) -> tuple:
+                pct = (count / total) * 100.0 if total else 0.0
+                bar = unicode_bar(count, max_for_bar or 1, width=22)
+                return (
+                    Text(label, no_wrap=True, overflow="ellipsis"),
+                    f"{count:,}",
+                    f"{pct:5.1f}%",
+                    Text(bar, style="cyan"),
+                )
+
+            # Summary rows (no bar / 100% style)
+            summary = [
+                ("Scan", stats["scan_name"], "", ""),
+                ("Started", stats["started_at"], "", ""),
+                ("Status", stats["status"], "", ""),
+                ("BBOT schema", stats["bbot_version"], "", ""),
+                ("Total events", f"{stats['total_events']:,}", "100%", unicode_bar(1, 1, 22)),
+                ("Vulns", f"{stats['vuln_count']:,}", "", ""),
+                ("Findings", f"{stats['finding_count']:,}", "", ""),
+                ("Annotations", f"{ann['total']:,}", "", ""),
+            ]
+            self.item_list = [("summary", k) for k, *_ in summary]
+            for lab, val, pct, bar in summary:
+                rows.append((
+                    Text(str(lab), no_wrap=True),
+                    Text(str(val), no_wrap=True, overflow="ellipsis"),
+                    Text(str(pct)),
+                    Text(bar, style="cyan") if bar else Text(""),
+                ))
+
+            # Event types with graphs
+            type_items = sorted(stats["event_types"].items(), key=lambda x: -x[1])
+            max_type = type_items[0][1] if type_items else 1
+            rows.append((Text("— Event types —", style="bold"), Text(""), Text(""), Text("")))
+            self.item_list.append(("section", "event_types"))
+            for et, cnt in type_items[:25]:
+                if self._matches_search(et):
+                    self.item_list.append(("event_type", et))
+                    rows.append(_row(et, cnt, max_type))
+
+            mod_items = sorted(stats["modules"].items(), key=lambda x: -x[1])
+            max_mod = mod_items[0][1] if mod_items else 1
+            rows.append((Text("— Top modules —", style="bold"), Text(""), Text(""), Text("")))
+            self.item_list.append(("section", "modules"))
+            for mod, cnt in mod_items[:15]:
+                if self._matches_search(mod):
+                    self.item_list.append(("module", mod))
+                    rows.append(_row(mod, cnt, max_mod))
+
+            scope_items = sorted(stats["scope_distances"].items(), key=lambda x: x[0] if isinstance(x[0], int) else 0)
+            max_scope = max((c for _, c in scope_items), default=1)
+            rows.append((Text("— Scope distance —", style="bold"), Text(""), Text(""), Text("")))
+            self.item_list.append(("section", "scope"))
+            for dist, cnt in scope_items:
+                label = f"distance {dist}"
+                if self._matches_search(label):
+                    self.item_list.append(("scope", dist))
+                    rows.append(_row(label, cnt, max_scope))
+
+            if stats.get("severities"):
+                sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]
+                sev_items = [(s, stats["severities"][s]) for s in sev_order if s in stats["severities"]]
+                max_sev = max((c for _, c in sev_items), default=1)
+                rows.append((Text("— Severity —", style="bold"), Text(""), Text(""), Text("")))
+                self.item_list.append(("section", "severity"))
+                for sev, cnt in sev_items:
+                    self.item_list.append(("severity", sev))
+                    rows.append(_row(sev, cnt, max_sev))
+
+            if ann.get("by_status"):
+                st_items = sorted(ann["by_status"].items(), key=lambda x: -x[1])
+                max_st = st_items[0][1] if st_items else 1
+                rows.append((Text("— Annotations —", style="bold"), Text(""), Text(""), Text("")))
+                self.item_list.append(("section", "annotations"))
+                for st, cnt in st_items:
+                    self.item_list.append(("ann_status", st))
+                    rows.append(_row(f"status:{st}", cnt, max_st))
+
             if rows:
                 table.add_rows(rows)
-            lines = [f"{a}: {b}" for a, b in stat_rows]
-            detail.set_text("Statistics", "\n".join(lines), json.dumps(stats, indent=2, default=str))
+            detail.set_text("Statistics · charts", report, self._stats_json)
             return
 
         elif view == "subs":
-            for sub in self.scan_data.subdomains:
-                if not self._matches_search(sub):
+            items = self.scan_data.iter_subdomain_events()
+            for ev in items:
+                data = get_data(ev)
+                name = str(data if not isinstance(data, dict) else (data.get("host") or data.get("name") or "")).strip()
+                if not name:
+                    name = str(ev.get("host") or "")
+                module = str(ev.get("module", "") or "")
+                tags_list = [str(t) for t in (ev.get("tags") or [])]
+                tags = ", ".join(tags_list[:8])
+                resolved = ev.get("resolved_hosts") or []
+                resolved_str = ", ".join(str(h) for h in resolved[:6])
+                if not self._matches_search(f"{name} {module} {tags} {resolved_str}"):
                     continue
-                self.item_list.append(sub)
-                rows.append((Text(sub),))
-            if rows:
-                table.add_rows(rows)
-            if self.item_list:
-                detail.set_text(
-                    "Subdomains",
-                    "\n".join(self.scan_data.subdomains),
-                    json.dumps(self.scan_data.subdomains, indent=2),
-                )
-            else:
-                if not self.scan_data.has_subdomains:
-                    detail.set_empty(
-                        "No subdomains.txt in this scan.\n"
-                        "(Generated by BBOT subdomain-enum / similar presets.)"
-                    )
-                else:
-                    detail.set_empty("No subdomains match filter.")
-            return
+                self.item_list.append(ev)
+                rows.append((
+                    Text(name, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                    str(ev.get("scope_distance", "")),
+                    Text(tags, no_wrap=True, overflow="ellipsis"),
+                    Text(resolved_str, no_wrap=True, overflow="ellipsis"),
+                ))
+                if len(rows) >= max_rows:
+                    break
 
         if rows:
             table.add_rows(rows)
@@ -2684,7 +3098,13 @@ class WorkspaceScreen(Screen):
             table.move_cursor(row=idx)
             self._show_detail(idx)
         else:
-            detail.set_empty("No items in this view (try search / type / status filter).")
+            if view == "subs" and not self.scan_data.iter_subdomain_events():
+                detail.set_empty(
+                    "No DNS_NAME events or subdomains.txt in this scan.\n"
+                    "(Try a subdomain-enum style preset.)"
+                )
+            else:
+                detail.set_empty("No items in this view (try search / type / status filter).")
 
     def _show_detail(self, index: int) -> None:
         if index == self._detail_index and index >= 0:
@@ -2697,7 +3117,7 @@ class WorkspaceScreen(Screen):
         item = self.item_list[index]
         view = self.current_view
 
-        if view in ("vulns", "findings", "events", "ips", "emails", "social"):
+        if view in ("vulns", "findings", "events", "ips", "emails", "social", "subs"):
             if not isinstance(item, dict):
                 detail.set_empty()
                 return
@@ -2717,6 +3137,23 @@ class WorkspaceScreen(Screen):
                     f"URL: {data.get('url', '')}\n\n"
                     + plain
                 )
+            elif view == "subs":
+                name = str(data if not isinstance(data, dict) else (data.get("host") or data)).strip()
+                if not name:
+                    name = str(item.get("host") or "")
+                resolved = item.get("resolved_hosts") or []
+                dns_children = item.get("dns_children") or {}
+                extra = [f"Subdomain: {name}"]
+                if resolved:
+                    extra.append(f"Resolved hosts: {', '.join(str(h) for h in resolved)}")
+                if isinstance(dns_children, dict) and dns_children:
+                    extra.append("DNS children:")
+                    for rtype, vals in dns_children.items():
+                        if isinstance(vals, (list, set, tuple)):
+                            extra.append(f"  {rtype}: {', '.join(str(v) for v in vals)}")
+                        else:
+                            extra.append(f"  {rtype}: {vals}")
+                plain = "\n".join(extra) + "\n\n" + plain
             uuid = item.get("uuid", "")
             ann = self.scan_data.annotation_manager.get_annotation(uuid)
             if ann:
@@ -2726,7 +3163,19 @@ class WorkspaceScreen(Screen):
                 plain += f"Note: {ann.get('note', '')}\n"
             jtxt = json.dumps(item, indent=2, default=str)
             title = f"{item.get('type', 'EVENT')}"
-            if isinstance(data, dict) and data.get("host"):
+            if view == "vulns" and isinstance(data, dict):
+                sev = normalize_severity(data.get("severity")) or "?"
+                title = f"Vuln · {sev}"
+                if data.get("name"):
+                    title += f" · {data.get('name')}"
+                elif data.get("host") or item.get("host"):
+                    title += f" · {data.get('host') or item.get('host')}"
+            elif view == "findings" and isinstance(data, dict):
+                title = f"Finding · {data.get('name') or data.get('host') or item.get('host') or ''}"
+            elif view == "subs":
+                name = str(data if not isinstance(data, dict) else (data.get("host") or data)).strip()
+                title = f"DNS · {name or item.get('host') or ''}"
+            elif isinstance(data, dict) and data.get("host"):
                 title += f" · {data.get('host')}"
             elif view == "ips":
                 title = f"IP · {data if not isinstance(data, dict) else data.get('ip') or data}"
@@ -2734,9 +3183,30 @@ class WorkspaceScreen(Screen):
                 title = f"Email · {data if not isinstance(data, dict) else data.get('email') or data}"
             elif view == "social" and isinstance(data, dict):
                 title = f"Social · {data.get('platform', '')} · {data.get('profile_name', '')}"
+            elif item.get("type") in ("URL", "URL_UNVERIFIED", "HTTP_RESPONSE"):
+                title = f"{item.get('type')} · {event_url(item, data) or item.get('host') or ''}"
             detail.set_text(title, plain, jtxt)
-        elif view == "subs":
-            detail.set_text("Subdomain", str(item), json.dumps(item))
+        elif view == "stats":
+            # Keep full chart report visible; optionally focus a subsection title
+            report = self._stats_report or self.scan_data.build_stats_report()
+            focus = ""
+            if isinstance(item, tuple) and len(item) == 2:
+                kind, key = item
+                if kind == "event_type":
+                    focus = f"Focused: event type {key}\n\n"
+                elif kind == "module":
+                    focus = f"Focused: module {key}\n\n"
+                elif kind == "severity":
+                    focus = f"Focused: severity {key}\n\n"
+                elif kind == "ann_status":
+                    focus = f"Focused: annotation status {key}\n\n"
+                elif kind == "scope":
+                    focus = f"Focused: scope distance {key}\n\n"
+            detail.set_text(
+                "Statistics · charts",
+                focus + report,
+                self._stats_json or json.dumps(self.scan_data.get_statistics(), indent=2, default=str),
+            )
         elif view == "config":
             detail.set_text(
                 "preset.yml",
@@ -2771,7 +3241,7 @@ class WorkspaceScreen(Screen):
             self._reload_items()
 
     def _current_event(self) -> Optional[dict]:
-        if self.current_view not in ("vulns", "findings", "events", "ips", "emails", "social"):
+        if self.current_view not in ("vulns", "findings", "events", "ips", "emails", "social", "subs"):
             return None
         table = self.query_one("#ws-table", SelectableTable)
         i = table.cursor_row

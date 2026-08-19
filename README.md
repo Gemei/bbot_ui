@@ -7,9 +7,12 @@
 
 A self-contained terminal UI for browsing and analyzing [BBOT](https://www.blacklanternsecurity.com/bbot/) scan results.
 
+Supports **BBOT 2.x and 3.x** NDJSON (`output.json`), including 3.0 breaking changes (`data_json`, FINDING-with-severity instead of `VULNERABILITY`, dict-backed URLs, `uuid` / `host_metadata`). See the [3.0 migration guide](https://www.blacklanternsecurity.com/bbot/Stable/migration/3.0_breaking_changes/).
+
 ## Features
 
 - **Zero setup** — single self-installing file; creates its own venv on first run
+- **BBOT 2.x + 3.x** — auto-detects event schema (`data` vs `data_json`)
 - **Scan browser** — live scans and archives in one place, with name filter
 - **Accurate status** — RUNNING / FINISHED / INTERRUPTED via process detection (psutil)
 - **Workspace views** — issues, assets, events, stats, and preset in a three-pane layout
@@ -19,6 +22,18 @@ A self-contained terminal UI for browsing and analyzing [BBOT](https://www.black
 - **Copy** — selected row (`c`), full table as markdown (`C` / `Shift+C`), JSON (`y`), or mouse selection
 - **Live refresh** — updates while a scan is running
 - **In-app help** — press `?`
+
+## BBOT version notes
+
+| Topic | BBOT 2.x | BBOT 3.x (how the UI maps it) |
+|-------|----------|--------------------------------|
+| Vulns | `type: VULNERABILITY` | `type: FINDING` with severity `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` |
+| Findings | `type: FINDING` | `FINDING` with severity `INFO` (or empty) |
+| Event payload | `data` (string or dict) | Dict events use `data_json`; strings still use `data` |
+| URLs | `data: "https://…"` | `data_json: { "url": "https://…", … }` |
+| Severity aliases | `INFORMATIONAL`, `MODERATE` | Normalized to `INFO`, `MEDIUM` |
+| Confidence | n/a | Shown when present (`UNKNOWN`…`CONFIRMED`) |
+| Modules | e.g. `httpx` | e.g. `http` (displayed as recorded in the scan) |
 
 ## Quick start
 
