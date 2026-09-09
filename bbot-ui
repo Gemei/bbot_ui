@@ -15,97 +15,122 @@ DEPENDENCIES = [
     "textual>=0.47.0",
     "rich>=13.0.0",
     "psutil>=5.9.0",  # For detecting active scan processes (cross-platform)
+    "pillow>=10.0.0",  # Screenshot previews (gowitness / WEBSCREENSHOT)
+    "textual-image>=0.8.2",  # Sharp in-terminal images (sixel / kitty)
 ]
+# Bump when DEPENDENCIES change so existing venvs reinstall automatically.
+DEPS_VERSION = "3"
+IMPORT_CHECKS = (
+    ("textual", "textual>=0.47.0"),
+    ("rich", "rich>=13.0.0"),
+    ("psutil", "psutil>=5.9.0"),
+    ("PIL", "pillow>=10.0.0"),
+    ("textual_image", "textual-image>=0.8.2"),
+)
+
+
+def _venv_paths():
+    venv_dir = Path("~/.bbot_ui_venv").expanduser()
+    if os.name == "nt":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+    return venv_dir, venv_python, venv_dir / ".setup_complete"
+
+
+def _missing_packages():
+    missing = []
+    for mod, spec in IMPORT_CHECKS:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(spec)
+    return missing
+
+
+def _marker_current(marker_file: Path) -> bool:
+    if not marker_file.exists():
+        return False
+    try:
+        first = marker_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return bool(first) and first[0].strip() == DEPS_VERSION
+    except Exception:
+        return False
+
+
+def _write_marker(marker_file: Path) -> None:
+    marker_file.parent.mkdir(parents=True, exist_ok=True)
+    marker_file.write_text(
+        DEPS_VERSION + "\n" + "\n".join(DEPENDENCIES) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _pip_install(python_exe: Path) -> None:
+    import subprocess
+    print("\nInstalling / updating BBOT TUI dependencies...")
+    subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "-q", "--upgrade", "pip"],
+        check=False,
+    )
+    for dep in DEPENDENCIES:
+        print(f"  - {dep}")
+        subprocess.run(
+            [str(python_exe), "-m", "pip", "install", "-q", dep],
+            check=True,
+        )
+    print("✓ Dependencies ready\n")
+
 
 def setup_environment():
-    """Set up virtual environment and install dependencies"""
+    """Create venv if needed, install deps, re-exec into venv."""
     script_path = Path(__file__).resolve()
-    venv_dir = Path("~/.bbot_ui_venv").expanduser()
-    marker_file = venv_dir / ".setup_complete"
-
-    # Check if setup is already complete
-    if marker_file.exists():
-        # Setup already done, just use the venv
-        if os.name == 'nt':  # Windows
-            venv_python = venv_dir / "Scripts" / "python.exe"
-        else:  # Unix/Linux/Mac
-            venv_python = venv_dir / "bin" / "python"
-
-        # Re-execute with venv python
-        os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
+    venv_dir, venv_python, marker_file = _venv_paths()
 
     print("=" * 60)
-    print("BBOT TUI - First Run Setup")
+    print("BBOT TUI - Setup")
     print("=" * 60)
 
-    # Create virtual environment
-    if not venv_dir.exists():
-        print(f"\n[1/3] Creating virtual environment at {venv_dir}")
+    if not venv_dir.exists() or not venv_python.exists():
+        print(f"\nCreating virtual environment at {venv_dir}")
         import venv
         venv.create(venv_dir, with_pip=True)
         print("✓ Virtual environment created")
 
-    # Determine venv python path
-    if os.name == 'nt':  # Windows
-        venv_python = venv_dir / "Scripts" / "python.exe"
-        venv_pip = venv_dir / "Scripts" / "pip.exe"
-    else:  # Unix/Linux/Mac
-        venv_python = venv_dir / "bin" / "python"
-        venv_pip = venv_dir / "bin" / "pip"
+    _pip_install(venv_python)
+    _write_marker(marker_file)
 
-    # Upgrade pip and install dependencies
-    print("\n[2/3] Installing dependencies...")
-    import subprocess
-
-    # Upgrade pip quietly
-    subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "-q", "--upgrade", "pip"],
-        check=True
-    )
-
-    # Install dependencies
-    for dep in DEPENDENCIES:
-        print(f"  - Installing {dep}")
-        subprocess.run(
-            [str(venv_pip), "install", "-q", dep],
-            check=True
-        )
-
-    print("✓ All dependencies installed")
-
-    # Create marker file to indicate setup is complete
-    marker_file.touch()
-
-    # Re-execute this script using the venv Python
-    print(f"\n[3/3] Launching BBOT TUI...")
+    print("Launching BBOT TUI...")
     print("=" * 60 + "\n")
-
     os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
 
-# Bootstrap: Check if we need to set up the environment
+
+# Bootstrap: always land in the venv and ensure current deps (incl. new ones).
 if __name__ == "__main__":
     script_path = Path(__file__).resolve()
-    venv_dir = Path("~/.bbot_ui_venv").expanduser()
-    marker_file = venv_dir / ".setup_complete"
+    venv_dir, venv_python, marker_file = _venv_paths()
+    is_venv_python = (
+        venv_python.exists()
+        and Path(sys.executable).resolve() == venv_python.resolve()
+    )
 
-    # Determine if we're running from the venv Python
-    if os.name == 'nt':  # Windows
-        venv_python = venv_dir / "Scripts" / "python.exe"
-    else:  # Unix/Linux/Mac
-        venv_python = venv_dir / "bin" / "python"
-
-    is_venv_python = venv_python.exists() and Path(sys.executable).resolve() == venv_python.resolve()
-
-    # If marker doesn't exist, run full setup
-    if not marker_file.exists():
+    if not venv_python.exists():
         setup_environment()
-        sys.exit(0)  # Should never reach here due to execv, but just in case
+        sys.exit(0)
 
-    # If marker exists but we're not running from venv, switch to venv
-    if marker_file.exists() and not is_venv_python:
+    if not is_venv_python:
         os.execv(str(venv_python), [str(venv_python), str(script_path)] + sys.argv[1:])
 
-    # If we reach here, we're in the venv and ready to run
+    # Running inside the venv: install anything missing (e.g. pillow added later).
+    missing = _missing_packages()
+    if missing or not _marker_current(marker_file):
+        print("=" * 60)
+        print("BBOT TUI - Updating dependencies")
+        if missing:
+            print("Missing:", ", ".join(missing))
+        print("=" * 60)
+        _pip_install(Path(sys.executable))
+        _write_marker(marker_file)
 
 # ============================================================================
 # Main Application Code (runs only after environment is set up)
@@ -133,11 +158,37 @@ from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
+from textual.message import Message
 from textual import work
 from rich.text import Text
 from rich.markup import escape as escape_markup
 import zipfile
 import shutil
+import re
+
+try:
+    # Must import before App.run() — queries terminal cell pixel size once.
+    # Sixel/TGP draw real pixels (sharp). Half-cell unicode is what looked pixelated.
+    from textual_image.widget import SixelImage, TGPImage, Image as AutoTermImage
+    HAS_TERM_IMAGE = True
+except Exception:
+    SixelImage = None  # type: ignore[misc, assignment]
+    TGPImage = None  # type: ignore[misc, assignment]
+    AutoTermImage = None  # type: ignore[misc, assignment]
+    HAS_TERM_IMAGE = False
+
+
+def _make_term_image(image=None, **kwargs):
+    """Sharp terminal image: sixel first, then kitty TGP. Avoid half-cell photos."""
+    args = (image,) if image is not None else ()
+    for cls in (SixelImage, TGPImage, AutoTermImage):
+        if cls is None:
+            continue
+        try:
+            return cls(*args, **kwargs)
+        except Exception:
+            continue
+    return None
 
 
 # ============================================================================
@@ -768,6 +819,223 @@ def format_bar_chart(
     return "\n".join(lines)
 
 
+def extract_scan_targets_from_data(data: Any) -> str:
+    """Human-readable in-scope target(s) from a SCAN event payload."""
+    names: List[str] = []
+
+    def _add(val: Any) -> None:
+        if val is None or val is False:
+            return
+        if isinstance(val, (list, tuple, set)):
+            for item in val:
+                _add(item)
+            return
+        if isinstance(val, dict):
+            for key in ("seeds", "whitelist", "target", "targets"):
+                if key in val:
+                    _add(val[key])
+            return
+        text = str(val).strip()
+        if not text or text.startswith("REGEX") or text.startswith("#"):
+            return
+        names.append(text)
+
+    if isinstance(data, dict):
+        _add(data.get("target"))
+        _add(data.get("targets"))
+        _add(data.get("seeds"))
+    seen = set()
+    unique: List[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    return ", ".join(unique[:6])
+
+
+def gowitness_url_slug(url: str) -> str:
+    """Approximate gowitness screenshot filename stem from a URL."""
+    slug = url.strip().replace("://", "---")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", slug)
+    return slug.strip("-").lower()
+
+
+_SHOT_EXTS = {".jpeg", ".jpg", ".png", ".webp"}
+_SHOT_RENDER_CACHE: Dict[tuple, Text] = {}
+
+
+def build_screenshot_index(scan_path: Path) -> Dict[str, Any]:
+    """List screenshot files once (dirs can be huge)."""
+    files: List[Path] = []
+    seen = set()
+    dirs = [
+        scan_path / "gowitness" / "screenshots",
+        scan_path / "screenshots",
+        scan_path / "gowitness",
+    ]
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.iterdir():
+                if f.is_file() and f.suffix.lower() in _SHOT_EXTS:
+                    key = str(f)
+                    if key not in seen:
+                        seen.add(key)
+                        files.append(f)
+        except Exception:
+            continue
+    by_stem = {f.stem.lower(): f for f in files}
+    return {"files": files, "by_stem": by_stem}
+
+
+def find_screenshot_file(
+    scan_path: Path,
+    url: str,
+    folder: str = "",
+    index: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """Locate a gowitness / WEBSCREENSHOT image for a URL."""
+    if folder:
+        p = Path(folder)
+        if not p.is_absolute():
+            p = scan_path / p
+        if p.is_file() and p.suffix.lower() in _SHOT_EXTS:
+            return p
+        # Sometimes BBOT stores a relative filename only
+        if p.suffix.lower() in _SHOT_EXTS:
+            for parent in (
+                scan_path / "gowitness" / "screenshots",
+                scan_path / "screenshots",
+                scan_path,
+            ):
+                cand = parent / p.name
+                if cand.is_file():
+                    return cand
+
+    if index is None:
+        index = build_screenshot_index(scan_path)
+    by_stem: Dict[str, Path] = index.get("by_stem") or {}
+    files: List[Path] = index.get("files") or []
+    if not files:
+        return None
+
+    slug = gowitness_url_slug(url)
+    if slug:
+        if slug in by_stem:
+            return by_stem[slug]
+        # gowitness truncates long stems
+        for stem, f in by_stem.items():
+            if slug.startswith(stem) or stem.startswith(slug[:48]) or slug[:48] in stem:
+                return f
+
+    host = ""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        pass
+    if host:
+        host_slug = host.replace(".", "-")
+        for f in files:
+            low = f.stem.lower()
+            if host in low or host_slug in low:
+                return f
+    return None
+
+
+def open_path_external(path: Path) -> None:
+    """Open a file with the OS image viewer (Windows / WSL / Linux)."""
+    import shutil
+    import subprocess
+
+    target = str(path)
+    try:
+        if os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+            return
+        if shutil.which("wslview"):
+            subprocess.Popen(["wslview", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        if shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        # WSL without wslview: let Windows Explorer open the UNC path
+        subprocess.Popen(
+            ["explorer.exe", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def render_screenshot(path: Path, max_width: int = 240, max_height_cells: int = 400) -> Text:
+    """Render an image as colored half-block unicode (▀), cached.
+
+    Prefer near 1:1 (one image pixel per cell in X, two pixels per cell in Y)
+    so text in gowitness shots stays readable. The pane scrolls instead of
+    squashing the whole page into a thumbnail.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0
+    cache_key = (str(path), int(max_width), int(max_height_cells), mtime)
+    cached = _SHOT_RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        return Text(
+            "Screenshot preview needs Pillow (should auto-install on next launch).\n"
+            f"File: {path}"
+        )
+    try:
+        im = PILImage.open(path).convert("RGB")
+    except Exception as e:
+        return Text(f"Could not open image:\n{path}\n{e}")
+
+    w, h = im.size
+    # Never upscale (that only adds blur). Downscale only if the image is huge.
+    max_w = max(16, int(max_width))
+    max_px_h = max(4, int(max_height_cells) * 2)
+    if w > max_w or h > max_px_h:
+        scale = min(max_w / w, max_px_h / h, 1.0)
+        nw = max(1, int(round(w * scale)))
+        nh = max(2, int(round(h * scale)))
+        resample = getattr(PILImage, "Resampling", PILImage).BOX
+        im = im.resize((nw, nh), resample)
+    else:
+        nw, nh = w, h
+    if nh % 2:
+        # Pad one pixel rather than stretching
+        canvas = PILImage.new("RGB", (nw, nh + 1), (0, 0, 0))
+        canvas.paste(im, (0, 0))
+        im = canvas
+        nh += 1
+    px = im.load()
+    out = Text()
+    out.append(
+        f"{path.name}  {w}×{h}px  →  {nw}×{nh // 2} cells  (scroll · Enter=larger · o=open file)\n",
+        style="dim",
+    )
+    for y in range(0, nh, 2):
+        line = Text()
+        for x in range(nw):
+            r1, g1, b1 = px[x, y]
+            r2, g2, b2 = px[x, y + 1] if y + 1 < nh else (0, 0, 0)
+            line.append("▀", style=f"rgb({r1},{g1},{b1}) on rgb({r2},{g2},{b2})")
+        line.append("\n")
+        out.append(line)
+    if len(_SHOT_RENDER_CACHE) > 24:
+        _SHOT_RENDER_CACHE.clear()
+    _SHOT_RENDER_CACHE[cache_key] = out
+    return out
+
+
 class AnnotationManager:
     """Manages annotations for a scan"""
 
@@ -877,12 +1145,16 @@ class ScanData:
         self.cache_ttl = 5.0  # Cache results for 5 seconds
         self.annotation_manager = AnnotationManager(scan_path)  # Annotation system
         self.bbot_version = "unknown"  # BBOT version detection: "2.x", "3.0", or "unknown"
+        self._shot_index: Optional[Dict[str, Any]] = None
+        self._shot_events: Optional[List[Dict[str, Any]]] = None
         self.load_events()
         self.load_preset()
         self.load_subdomains()
 
     def load_events(self):
         """Load events from output.json and detect BBOT version"""
+        self._shot_index = None
+        self._shot_events = None
         json_file = self.scan_path / "output.json"
         if not json_file.exists():
             return
@@ -1033,6 +1305,8 @@ class ScanData:
             self.load_events()
             self.load_preset()
             self.load_subdomains()
+            self._shot_index = None
+            self._shot_events = None
             # Non-zero so callers refresh UI even if event count is unchanged
             return max(1, len(self.events))
 
@@ -1065,6 +1339,9 @@ class ScanData:
             # If there's an error reading incrementally, try full reload next time
             pass
 
+        if new_event_count:
+            self._shot_index = None
+            self._shot_events = None
         return new_event_count
 
     def load_preset(self):
@@ -1244,6 +1521,37 @@ class ScanData:
             key=lambda e: self._dns_event_hostname(e),
         )
 
+    def iter_screenshot_events(self) -> List[Dict[str, Any]]:
+        """WEBSCREENSHOT / gowitness events with resolved image paths (cached)."""
+        if self._shot_events is not None:
+            return self._shot_events
+        if self._shot_index is None:
+            self._shot_index = build_screenshot_index(self.scan_path)
+        items = []
+        for ev in self.events:
+            if ev.get("type") not in ("WEBSCREENSHOT", "WEB_SCREENSHOT"):
+                continue
+            data = self._get_event_data(ev)
+            url = ""
+            folder = ""
+            if isinstance(data, dict):
+                url = str(data.get("url") or "")
+                folder = str(data.get("path") or "")
+            else:
+                url = str(data or "")
+            if not url:
+                url = str(ev.get("url") or "")
+            path = find_screenshot_file(
+                self.scan_path, url, folder, index=self._shot_index
+            )
+            rec = dict(ev)
+            rec["_screenshot_url"] = url
+            rec["_screenshot_path"] = str(path) if path else ""
+            items.append(rec)
+        items.sort(key=lambda e: e.get("_screenshot_url") or "")
+        self._shot_events = items
+        return items
+
     def get_statistics(self) -> Dict[str, Any]:
         """Calculate statistics from events"""
         event_types = {}
@@ -1354,18 +1662,108 @@ class ScanData:
         return "\n".join(lines).rstrip() + "\n"
 
 # ============================================================================
+# Persistent column layout (~/.bbot_ui/column_layout.json)
+# ============================================================================
+
+_UI_STATE_DIR = Path("~/.bbot_ui").expanduser()
+_COLUMN_LAYOUT_FILE = _UI_STATE_DIR / "column_layout.json"
+
+
+class ColumnLayoutStore:
+    """Load/save table column widths and hidden columns across sessions."""
+
+    _cache: Optional[dict] = None
+
+    @classmethod
+    def load_all(cls) -> dict:
+        if cls._cache is not None:
+            return cls._cache
+        try:
+            if _COLUMN_LAYOUT_FILE.is_file():
+                cls._cache = json.loads(_COLUMN_LAYOUT_FILE.read_text(encoding="utf-8"))
+            else:
+                cls._cache = {}
+        except Exception:
+            cls._cache = {}
+        if not isinstance(cls._cache, dict):
+            cls._cache = {}
+        return cls._cache
+
+    @classmethod
+    def get(cls, key: str) -> tuple:
+        data = cls.load_all().get(key) or {}
+        widths = {}
+        for k, v in (data.get("widths") or {}).items():
+            try:
+                widths[str(k)] = max(4, int(v))
+            except (TypeError, ValueError):
+                continue
+        hidden = [str(x) for x in (data.get("hidden") or [])]
+        return widths, hidden
+
+    @classmethod
+    def put(cls, key: str, widths: dict, hidden) -> None:
+        if not key:
+            return
+        all_data = cls.load_all()
+        all_data[key] = {
+            "widths": {str(k): int(v) for k, v in widths.items() if int(v) > 0},
+            "hidden": list(hidden),
+        }
+        cls._cache = all_data
+        try:
+            _UI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+            _COLUMN_LAYOUT_FILE.write_text(
+                json.dumps(all_data, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+# ============================================================================
 # Shared table / detail widgets
 # ============================================================================
 
 class SelectableTable(DataTable):
-    """DataTable with text selection, zebra rows, and markdown export for copy."""
+    """DataTable with text selection, zebra rows, markdown export, sort/resize/hide."""
 
     ALLOW_SELECT = True
+    # When False, mouse-move won't highlight rows (sixel previews poison mouse coords).
+    track_hover = True
+    BINDINGS = [
+        Binding("h", "hide_column", "Hide col"),
+        Binding("u", "unhide_columns", "Unhide"),
+        Binding("minus,left_square_bracket", "shrink_column", "Narrow"),
+        Binding("plus,equals,right_square_bracket", "widen_column", "Widen"),
+        Binding("shift+left", "shrink_column", "Narrow", show=False),
+        Binding("shift+right", "widen_column", "Widen", show=False),
+    ]
+
+    class ViewOrderChanged(Message):
+        """Posted after sort/hide so parents can sync backing lists."""
+
+        def __init__(self, table: "SelectableTable", reload: bool = False) -> None:
+            super().__init__()
+            self.table = table
+            self.reload = reload
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cursor_type = "row"
         self.zebra_stripes = True
+        self._payloads: Dict[Any, Any] = {}
+        self._sort_col = None
+        self._sort_reverse = False
+        self._hidden_labels: set = set()
+        self._widths: Dict[str, int] = {}
+        self._last_col_index = 0
+        self._declared_columns: List[str] = []
+        self._drag_col_index: Optional[int] = None
+        self._drag_start_x = 0
+        self._drag_start_w = 0
+        self.layout_key = kwargs.get("id") or ""
+        self.load_layout()
 
     @staticmethod
     def _cell_text(value: Any) -> str:
@@ -1458,6 +1856,465 @@ class SelectableTable(DataTable):
         """Export the full visible table as markdown."""
         return self.export_markdown(row_indices=None)
 
+    def visible_column_labels(self, labels: List[str]) -> List[str]:
+        self._declared_columns = list(labels)
+        return [lab for lab in labels if lab not in self._hidden_labels]
+
+    def filter_cells(self, labels: List[str], cells: tuple) -> tuple:
+        """Drop cells whose column label is hidden."""
+        out = []
+        for lab, cell in zip(labels, cells):
+            if lab not in self._hidden_labels:
+                out.append(cell)
+        return tuple(out)
+
+    def add_payload_rows(self, rows_and_payloads: List[tuple]) -> None:
+        """Add rows as (cells_tuple, payload). Cells must already be filtered."""
+        self._payloads = {}
+        if not rows_and_payloads:
+            return
+        keys = self.add_rows([cells for cells, _ in rows_and_payloads])
+        for key, (_cells, payload) in zip(keys, rows_and_payloads):
+            self._payloads[key] = payload
+        try:
+            self._update_dimensions(keys)
+            self._require_update_dimensions = False
+            if hasattr(self, "_new_rows"):
+                self._new_rows.clear()
+        except Exception:
+            pass
+        self._apply_stored_widths()
+        self._reapply_sort()
+        self._fit_content_widths()
+
+    def load_layout(self) -> None:
+        if not self.layout_key:
+            return
+        widths, hidden = ColumnLayoutStore.get(self.layout_key)
+        self._widths = dict(widths)
+        self._hidden_labels = set(hidden)
+
+    def save_layout(self) -> None:
+        if not self.layout_key:
+            return
+        # Capture current on-screen widths (skip hidden / zero)
+        for col in self.ordered_columns:
+            lab = self._col_label(col)
+            if lab in self._hidden_labels:
+                continue
+            w = int(col.width or 0)
+            if w > 0:
+                self._widths[lab] = w
+        ColumnLayoutStore.put(self.layout_key, self._widths, self._hidden_labels)
+
+    def set_layout_key(self, key: str) -> None:
+        """Switch persisted layout (saves the previous view first)."""
+        if self.layout_key and self.layout_key != key:
+            self.save_layout()
+        self.layout_key = key
+        self.load_layout()
+
+    def payloads_in_view_order(self) -> List[Any]:
+        ordered = []
+        for row in self.ordered_rows:
+            if row.key in self._payloads:
+                ordered.append(self._payloads[row.key])
+        return ordered
+
+    def _col_label(self, col) -> str:
+        lab = col.label.plain if isinstance(col.label, Text) else str(col.label)
+        return lab.replace(" ▲", "").replace(" ▼", "")
+
+    def _relayout(self) -> None:
+        """Apply column width changes and grow the table's scrollable area."""
+        if hasattr(self, "_clear_caches"):
+            try:
+                self._clear_caches()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # DataTable only recomputes virtual_size (needed to WIDEN columns)
+        # when this flag is set — otherwise extra width is clipped.
+        self._require_update_dimensions = True
+        self._update_count = getattr(self, "_update_count", 0) + 1
+        try:
+            self._update_dimensions([])  # recompute virtual_size now (needed to grow)
+            self._require_update_dimensions = False
+        except Exception:
+            try:
+                self.check_idle()
+            except Exception:
+                pass
+        self.refresh(layout=True)
+        self._sync_hscroll()
+
+    # (min, max, extra-space weight) — keep short cols tight, let names/URLs grow
+    _COL_PRESETS = {
+        "Severity": (9, 12, 0),
+        "Confidence": (10, 12, 0),
+        "Status": (9, 14, 0),
+        "Module": (8, 16, 0),
+        "Scope": (5, 7, 0),
+        "Time": (16, 20, 0),
+        "Modified": (16, 20, 0),
+        "Events": (6, 8, 0),
+        "Vulns": (5, 8, 0),
+        "Findings": (8, 10, 0),
+        "Count": (6, 10, 0),
+        "%": (5, 8, 0),
+        "Graph": (16, 24, 0),
+        "Resolved": (8, 10, 0),
+        "Type": (10, 18, 0),
+        "Platform": (10, 16, 0),
+        "IP Address": (13, 20, 0),
+        "Host": (14, 34, 2),
+        "Name": (14, 32, 2),
+        "Target": (14, 36, 2),
+        "Email": (16, 36, 2),
+        "Profile": (12, 24, 1),
+        "Tags": (12, 28, 1),
+        "File": (12, 28, 1),
+        "Subdomain": (16, 40, 3),
+        "URL": (20, 50, 3),
+        "Data": (16, 44, 3),
+        "Metric": (14, 32, 1),
+    }
+
+    def _col_preset(self, lab: str) -> tuple:
+        return self._COL_PRESETS.get(lab, (8, 36, 1))
+
+    def _fit_content_widths(self) -> None:
+        """Size columns to content (capped) and use leftover space on flexible cols."""
+        cols = [c for c in self.ordered_columns if self._col_label(c) not in self._hidden_labels]
+        if not cols:
+            return
+        # Saved / user widths: do not redistribute (sort must not change sizes)
+        if all(self._col_label(c) in self._widths for c in cols):
+            self._apply_stored_widths()
+            return
+        try:
+            avail = max(int(self.size.width) - 1, 40)
+        except Exception:
+            avail = 80
+        pad = int(getattr(self, "cell_padding", 1) or 0)
+        chrome = len(cols) * (2 * pad + 1)
+        budget = max(len(cols) * 6, avail - chrome)
+
+        ideals = []
+        weights = []
+        for col in cols:
+            lab = self._col_label(col)
+            mn, mx, weight = self._col_preset(lab)
+            header_w = max(len(lab), mn)
+            if lab in self._widths:
+                ideal = max(4, int(self._widths[lab]))
+                weight = 0
+            else:
+                content = int(getattr(col, "content_width", 0) or 0)
+                ideal = min(max(content, header_w, mn), mx)
+            ideals.append(ideal)
+            weights.append(weight)
+
+        total = sum(ideals)
+        leftover = budget - total
+        if leftover > 0 and any(weights):
+            wsum = sum(weights) or 1
+            for i, w in enumerate(weights):
+                if w <= 0:
+                    continue
+                extra = int(leftover * (w / wsum))
+                _mn, mx, _ = self._col_preset(self._col_label(cols[i]))
+                ideals[i] = min(ideals[i] + extra, mx + leftover)
+        elif leftover < 0:
+            # Shrink flexible columns first, then any column down to its min
+            order = sorted(range(len(cols)), key=lambda i: weights[i], reverse=True)
+            remain = -leftover
+            for i in order:
+                lab = self._col_label(cols[i])
+                mn, _mx, _ = self._col_preset(lab)
+                if lab in self._widths:
+                    continue
+                can = ideals[i] - mn
+                if can <= 0:
+                    continue
+                take = min(can, remain)
+                ideals[i] -= take
+                remain -= take
+                if remain <= 0:
+                    break
+
+        for col, width in zip(cols, ideals):
+            lab = self._col_label(col)
+            if lab in self._hidden_labels:
+                continue
+            col.auto_width = False
+            col.width = max(4, int(width))
+            if lab not in self._widths:
+                self._widths[lab] = col.width
+        self._relayout()
+        self.save_layout()
+
+    def _sync_hscroll(self) -> None:
+        """Show a horizontal scrollbar only when columns overflow the viewport."""
+        try:
+            pad = int(getattr(self, "cell_padding", 1) or 0)
+            needed = 0
+            for col in self.ordered_columns:
+                if self._col_label(col) in self._hidden_labels:
+                    continue
+                needed += int(col.width or 0) + (2 * pad) + 1
+            view = int(self.size.width or 0)
+            overflow = bool(view) and needed > view + 1
+            self.styles.overflow_x = "auto" if overflow else "hidden"
+            try:
+                self.show_horizontal_scrollbar = overflow
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def on_resize(self) -> None:
+        self._sync_hscroll()
+
+    def _apply_stored_widths(self) -> None:
+        for col in self.ordered_columns:
+            lab_clean = self._col_label(col)
+            if lab_clean in self._hidden_labels:
+                col.auto_width = False
+                col.width = 0
+            elif lab_clean in self._widths:
+                col.auto_width = False
+                col.width = self._widths[lab_clean]
+        self._relayout()
+
+    def _freeze_auto_widths(self) -> None:
+        """Lock current computed widths so one resize doesn't get eaten by auto columns."""
+        for col in self.ordered_columns:
+            lab = self._col_label(col)
+            if lab in self._hidden_labels:
+                continue
+            if col.auto_width or lab not in self._widths:
+                w = max(int(col.width or 0), int(getattr(col, "content_width", 0) or 0), 6)
+                col.auto_width = False
+                col.width = w
+                self._widths[lab] = w
+
+    def _set_column_width(self, index: int, width: int, persist: bool = True) -> None:
+        cols = list(self.ordered_columns)
+        if index < 0 or index >= len(cols):
+            return
+        col = cols[index]
+        lab = self._col_label(col)
+        if lab in self._hidden_labels:
+            return
+        new_w = max(4, min(200, int(width)))
+        col.auto_width = False
+        col.width = new_w
+        self._widths[lab] = new_w
+        self._last_col_index = index
+        self._relayout()
+        if persist:
+            self.save_layout()
+
+    def _column_index_for_resize(self) -> int:
+        cols = list(self.ordered_columns)
+        if not cols:
+            return 0
+        return min(max(0, self._last_col_index), len(cols) - 1)
+
+    def _header_edges(self) -> List[tuple]:
+        """Return (column_index, edge_x) for each visible column's right edge."""
+        edges = []
+        x = 1  # gutter / row label-ish
+        if getattr(self, "show_row_labels", False):
+            x += 4
+        for i, col in enumerate(self.ordered_columns):
+            w = int(col.width or getattr(col, "content_width", 0) or 8)
+            if w <= 0:
+                continue
+            x += w
+            edges.append((i, x))
+            x += 1  # separator
+        return edges
+
+    def _on_mouse_move(self, event) -> None:
+        if not self.track_hover:
+            return
+        try:
+            super()._on_mouse_move(event)
+        except Exception:
+            pass
+
+    def on_mouse_down(self, event) -> None:
+        # Drag the header's right edge to resize (y==0 is the header row).
+        try:
+            y = event.y
+            x = event.x
+        except Exception:
+            return
+        if y != 0:
+            return
+        nearest = None
+        for idx, edge_x in self._header_edges():
+            if abs(x - edge_x) <= 2:
+                nearest = (idx, abs(x - edge_x))
+                break
+        if nearest is None:
+            # Clicking a header still selects that column for +/- resize
+            acc = 1
+            if getattr(self, "show_row_labels", False):
+                acc += 4
+            for i, col in enumerate(self.ordered_columns):
+                w = int(col.width or getattr(col, "content_width", 0) or 8)
+                if w <= 0:
+                    continue
+                if acc <= x < acc + w + 1:
+                    self._last_col_index = i
+                    break
+                acc += w + 1
+            return
+        idx = nearest[0]
+        cols = list(self.ordered_columns)
+        col = cols[idx]
+        self._freeze_auto_widths()
+        self._drag_col_index = idx
+        self._drag_start_x = x
+        self._drag_start_w = int(col.width or 8)
+        self._last_col_index = idx
+        try:
+            self.capture_mouse()
+        except Exception:
+            pass
+        event.stop()
+        event.prevent_default()
+
+    def on_mouse_move(self, event) -> None:
+        if self._drag_col_index is None:
+            return
+        delta = int(event.x) - self._drag_start_x
+        self._set_column_width(
+            self._drag_col_index, self._drag_start_w + delta, persist=False
+        )
+        event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        if self._drag_col_index is None:
+            return
+        self._drag_col_index = None
+        try:
+            self.release_mouse()
+        except Exception:
+            pass
+        self.save_layout()
+        event.stop()
+
+    def _reapply_sort(self) -> None:
+        if self._sort_col is None:
+            return
+        try:
+            self.sort(self._sort_col, reverse=self._sort_reverse)
+        except Exception:
+            pass
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        self._last_col_index = event.column_index
+        col_key = event.column_key
+        if self._sort_col == col_key:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col_key
+            self._sort_reverse = False
+        # Keep widths exactly as they are — the sort arrow must not resize columns
+        snapped = []
+        for col in self.ordered_columns:
+            snapped.append((int(col.width or 0), bool(col.auto_width)))
+        # Natural-ish sort: numeric strings as numbers
+        def _key(val):
+            if isinstance(val, tuple):
+                val = val[0] if val else ""
+            text = self._cell_text(val)
+            compact = text.replace(",", "").replace("%", "").strip()
+            try:
+                return (0, float(compact))
+            except ValueError:
+                return (1, text.lower())
+
+        try:
+            self.sort(col_key, key=_key, reverse=self._sort_reverse)
+        except Exception:
+            self.sort(col_key, reverse=self._sort_reverse)
+        arrow = " ▼" if self._sort_reverse else " ▲"
+        try:
+            for i, col in enumerate(self.ordered_columns):
+                base = self._col_label(col)
+                if i == event.column_index:
+                    col.label = Text(base + arrow)
+                else:
+                    col.label = Text(base)
+        except Exception:
+            pass
+        for col, (w, _auto) in zip(self.ordered_columns, snapped):
+            if self._col_label(col) in self._hidden_labels:
+                col.auto_width = False
+                col.width = 0
+            elif w > 0:
+                col.auto_width = False
+                col.width = w
+        self._relayout()
+        self.post_message(self.ViewOrderChanged(self, reload=False))
+        event.stop()
+
+    def action_hide_column(self) -> None:
+        cols = list(self.ordered_columns)
+        if len(cols) <= 1:
+            self.app.notify("Keep at least one column visible", severity="warning", timeout=2)
+            return
+        idx = min(max(0, self._last_col_index), len(cols) - 1)
+        col = cols[idx]
+        lab = col.label.plain if isinstance(col.label, Text) else str(col.label)
+        lab = lab.replace(" ▲", "").replace(" ▼", "")
+        visible = [c for c in cols if (c.width or c.content_width) > 0]
+        if len(visible) <= 1:
+            self.app.notify("Keep at least one column visible", severity="warning", timeout=2)
+            return
+        if lab not in self._widths:
+            self._widths[lab] = col.width or col.content_width or 12
+        col.auto_width = False
+        col.width = 0
+        self._hidden_labels.add(lab)
+        self._relayout()
+        self.save_layout()
+        self.app.notify(f"Hidden column: {lab}  (press u to restore)", timeout=2)
+
+    def action_unhide_columns(self) -> None:
+        for col in self.ordered_columns:
+            lab = col.label.plain if isinstance(col.label, Text) else str(col.label)
+            lab = lab.replace(" ▲", "").replace(" ▼", "")
+            if lab in self._hidden_labels:
+                col.width = self._widths.get(lab, max(8, col.content_width or 12))
+                col.auto_width = lab not in self._widths
+        self._hidden_labels.clear()
+        self._relayout()
+        self.save_layout()
+        self.app.notify("All columns restored", timeout=2)
+
+    def action_shrink_column(self) -> None:
+        self._nudge_column(-6)
+
+    def action_widen_column(self) -> None:
+        self._nudge_column(6)
+
+    def _nudge_column(self, delta: int) -> None:
+        cols = list(self.ordered_columns)
+        if not cols:
+            return
+        self._freeze_auto_widths()
+        idx = self._column_index_for_resize()
+        col = cols[idx]
+        lab = self._col_label(col)
+        current = self._widths.get(lab) or col.width or getattr(col, "content_width", 0) or 12
+        self._set_column_width(idx, int(current) + delta)
+        self.app.notify(f"{lab}: width {self._widths.get(lab, current)}", timeout=1)
+
     # Back-compat aliases used by older call sites
     def export_selected_row_tsv(self) -> str:
         return self.export_selected_row_markdown()
@@ -1481,15 +2338,78 @@ class DetailPane(Vertical):
             read_only=True,
             show_line_numbers=False,
         )
+        self._shot_scroll = VerticalScroll(id="shot-scroll")
+        self._shot = Static("", id="shot-view", classes="shot-view")
+        self._img = _make_term_image(id="shot-img")
+        self._shot_path: Optional[Path] = None
+        self._shot_caption = ""
+        self._shot_token = 0
 
     def compose(self) -> ComposeResult:
         yield self._title
         yield self._body
+        with Vertical(id="shot-box"):
+            if self._img is not None:
+                yield self._img
+            with self._shot_scroll:
+                yield self._shot
+
+    def on_mount(self) -> None:
+        self._shot_scroll.display = False
+        try:
+            self.query_one("#shot-box").display = False
+        except Exception:
+            pass
+        if self._img is not None:
+            self._img.display = False
+
+    @staticmethod
+    def _thumb_cells(path: Path, max_w: int = 36, max_h: int = 12) -> tuple:
+        """Contain-fit into max_w x max_h cells (keep aspect, fill the box)."""
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(path) as im:
+                pw, ph = im.size
+        except Exception:
+            return max(12, max_w // 2), max(6, max_h)
+        cell_w, cell_h = 10, 20
+        try:
+            from textual_image._terminal import get_cell_size
+            cs = get_cell_size()
+            cell_w = max(1, int(cs.width))
+            cell_h = max(1, int(cs.height))
+        except Exception:
+            pass
+        img_cw = max(1.0, pw / cell_w)
+        img_ch = max(1.0, ph / cell_h)
+        max_w = max(8, int(max_w))
+        max_h = max(4, int(max_h))
+        scale = min(max_w / img_cw, max_h / img_ch)
+        return max(8, int(round(img_cw * scale))), max(4, int(round(img_ch * scale)))
+
+    def _apply_preview_size(self) -> None:
+        if self._img is None or not self._shot_path:
+            return
+        try:
+            box = self.query_one("#shot-box")
+            max_w = max(24, int(box.size.width) - 2)
+            max_h = max(10, int(box.size.height) - 1)
+        except Exception:
+            max_w, max_h = 56, 24
+        cw, ch = self._thumb_cells(self._shot_path, max_w=max_w, max_h=max_h)
+        self._img.styles.width = cw
+        self._img.styles.height = ch
+
+    def on_resize(self) -> None:
+        if self._img is not None and self._img.display:
+            self._apply_preview_size()
 
     def set_empty(self, message: str = "Select a row to view details.") -> None:
         self.plain_text = ""
         self.json_text = ""
         self._title.update("Details")
+        self._hide_shot()
+        self._body.display = True
         self._body.load_text(
             f"{message}\n\nKeys: c copy row · Shift+C / C copy table (markdown) · y JSON"
         )
@@ -1497,6 +2417,8 @@ class DetailPane(Vertical):
     def set_text(self, title: str, plain: str, json_text: str = "") -> None:
         plain = plain or ""
         json_text = json_text or plain or ""
+        self._hide_shot()
+        self._body.display = True
         # Skip TextArea reload when content unchanged (big win while arrowing rows slowly)
         if plain == self.plain_text and json_text == self.json_text:
             self._title.update(title)
@@ -1506,6 +2428,80 @@ class DetailPane(Vertical):
         self._title.update(title)
         self._body.load_text(self.plain_text if self.plain_text else "(empty)")
 
+    def set_screenshot(self, title: str, caption: str, image_path: Optional[Path]) -> None:
+        self.plain_text = caption
+        self.json_text = caption
+        self._title.update(title)
+        self._body.display = False
+        self._shot_path = image_path if image_path and image_path.is_file() else None
+        self._shot_caption = caption
+        if not self._shot_path:
+            try:
+                self.query_one("#shot-box").display = True
+            except Exception:
+                pass
+            if self._img is not None:
+                self._img.display = False
+            self._shot_scroll.display = True
+            self._shot.update(Text(caption + "\n\n(no image file found on disk)"))
+            return
+        try:
+            self.query_one("#shot-box").display = True
+        except Exception:
+            pass
+        if self._img is not None:
+            self._shot_scroll.display = False
+            self._img.display = True
+            try:
+                self._img.image = str(self._shot_path)
+                self._apply_preview_size()
+            except Exception as e:
+                self._img.display = False
+                self._shot_scroll.display = True
+                self._shot.update(Text(f"Could not display image:\n{e}"))
+            return
+        self._shot_scroll.display = True
+        self._shot.update(Text("Rendering preview…  (o = open file)", style="dim"))
+        self._kick_shot_render()
+
+    def _hide_shot(self) -> None:
+        self._shot_scroll.display = False
+        try:
+            self.query_one("#shot-box").display = False
+        except Exception:
+            pass
+        if self._img is not None:
+            self._img.display = False
+            try:
+                self._img.image = None
+            except Exception:
+                pass
+
+    def _kick_shot_render(self) -> None:
+        self._shot_token += 1
+        token = self._shot_token
+        path = self._shot_path
+        if not path:
+            return
+        try:
+            w = max(24, self.size.width - 2)
+            h = max(8, self.size.height - 4)
+        except Exception:
+            w, h = 48, 18
+        self._render_shot_worker(str(path), w, h, token)
+
+    @work(exclusive=True, thread=True)
+    def _render_shot_worker(self, path_str: str, w: int, h: int, token: int) -> None:
+        text = render_screenshot(Path(path_str), max_width=w, max_height_cells=h)
+        def _apply() -> None:
+            if token != self._shot_token or not self._shot_scroll.display:
+                return
+            self._shot.update(text)
+        try:
+            self.app.call_from_thread(_apply)
+        except Exception:
+            pass
+
     def set_json(self, title: str, obj: Any) -> None:
         text = json.dumps(obj, indent=2, default=str) if obj else ""
         self.set_text(title, text, text)
@@ -1514,6 +2510,73 @@ class DetailPane(Vertical):
 # ============================================================================
 # Dialogs
 # ============================================================================
+
+class ScreenshotPreviewScreen(ModalScreen[None]):
+    """Full-terminal screenshot preview (Enter from Screenshots view)."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("q", "close", "Close", show=False),
+        Binding("enter", "close", "Close", show=False),
+        Binding("o", "open_file", "Open file", show=True),
+    ]
+
+    def __init__(self, image_path: Path, caption: str = ""):
+        super().__init__()
+        self.image_path = image_path
+        self.caption = caption
+        self._body = Static("Rendering…", id="shot-full")
+        self._img = _make_term_image(str(image_path), id="shot-full-img")
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="shot-full-dialog"):
+            yield Static(
+                f"{self.image_path.name}   Esc close · o open file",
+                classes="pane-title",
+            )
+            if self._img is not None:
+                yield self._img
+            else:
+                with VerticalScroll(id="shot-full-scroll"):
+                    yield self._body
+
+    def on_mount(self) -> None:
+        self._size_image()
+
+    def on_resize(self) -> None:
+        self._size_image()
+
+    def _size_image(self) -> None:
+        if self._img is None:
+            self._render()
+            return
+        max_w = max(24, int(self.size.width) - 4)
+        max_h = max(10, int(self.size.height) - 3)
+        cw, ch = DetailPane._thumb_cells(self.image_path, max_w=max_w, max_h=max_h)
+        self._img.styles.width = cw
+        self._img.styles.height = ch
+
+    @work(exclusive=True, thread=True)
+    def _render(self) -> None:
+        try:
+            w = max(40, self.size.width - 4)
+            h = max(12, self.size.height - 4)
+        except Exception:
+            w, h = 80, 24
+        text = render_screenshot(self.image_path, max_width=w, max_height_cells=h)
+        def _apply() -> None:
+            self._body.update(text)
+        try:
+            self.app.call_from_thread(_apply)
+        except Exception:
+            pass
+
+    def action_open_file(self) -> None:
+        open_path_external(self.image_path)
+
+    def action_close(self) -> None:
+        self.dismiss()
+
 
 class HelpScreen(ModalScreen[None]):
     """Keyboard reference."""
@@ -1550,8 +2613,10 @@ BROWSER (scan list)
 WORKSPACE (inside a scan)
   Views (issues → assets → raw → meta):
     1 Vulns · 2 Findings
-    3 IPs · 4 Emails · 5 Social · 6 Subdomains
-    7 Events · 8 Stats · 9 Preset
+    3 IPs · 4 Emails · 5 Social · 6 Subdomains · 7 Screenshots
+    8 Events · 9 Stats · 0 Preset
+  Click table headers to sort · drag header edge to resize
+  h hide column · u unhide · +/- or [ ] or Shift+←/→ resize last-clicked column
   Tab     Cycle views
   / or f  Focus filter / search
   Type dropdown: Events · Platform dropdown: Social
@@ -1741,12 +2806,20 @@ class BrowserScreen(Screen):
 
     def on_mount(self) -> None:
         table = self.query_one("#browser-table", SelectableTable)
-        table.add_columns("Name", "Status", "Events", "Vulns", "Findings", "Modified")
+        table.layout_key = "browser"
+        table.load_layout()
+        table.add_columns(*table.visible_column_labels(
+            ["Name", "Target", "Status", "Events", "Vulns", "Findings", "Modified"]
+        ))
         self._set_title()
         self.action_refresh()
         self._timer = self.set_interval(self.refresh_interval, self._auto_refresh)
 
     def on_unmount(self) -> None:
+        try:
+            self.query_one("#browser-table", SelectableTable).save_layout()
+        except Exception:
+            pass
         if self._timer:
             self._timer.stop()
 
@@ -1868,9 +2941,11 @@ class BrowserScreen(Screen):
                         results.append(prev)
                         continue
             try:
-                status, events, vulns, findings, modified, modified_ts = self._scan_summary(output_json)
+                status, events, vulns, findings, modified, modified_ts, target = self._scan_summary(output_json)
             except Exception:
-                status, events, vulns, findings, modified, modified_ts = "UNKNOWN", 0, 0, 0, "?", 0.0
+                status, events, vulns, findings, modified, modified_ts, target = (
+                    "UNKNOWN", 0, 0, 0, "?", 0.0, ""
+                )
             results.append({
                 "kind": "scan",
                 "name": name,
@@ -1881,6 +2956,7 @@ class BrowserScreen(Screen):
                 "finding_count": findings,
                 "modified": modified,
                 "modified_ts": modified_ts,
+                "target": target,
             })
         # Newest scans first
         results.sort(key=lambda r: r.get("modified_ts") or 0, reverse=True)
@@ -1895,13 +2971,16 @@ class BrowserScreen(Screen):
             summary = cached[2]
             # Older cache entries lacked mtime as 6th field
             if isinstance(summary, tuple) and len(summary) == 5:
-                return (*summary, cached[0])
+                return (*summary, cached[0], "")
+            if isinstance(summary, tuple) and len(summary) == 6:
+                return (*summary, "")
             return summary
 
         modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
         size = st.st_size
         events = vulns = findings = 0
         last_status = "UNKNOWN"
+        target_label = ""
 
         with open(output_json, "r", encoding="utf-8", errors="ignore") as f:
             if size > 2_000_000:
@@ -1926,6 +3005,9 @@ class BrowserScreen(Screen):
                             stt = data.get("status")
                             if stt:
                                 last_status = stt
+                            tgt = extract_scan_targets_from_data(data)
+                            if tgt:
+                                target_label = tgt
                     elif t:
                         sample_events += 1
                         vd, fd = classify_issue_counts(ev)
@@ -1951,6 +3033,9 @@ class BrowserScreen(Screen):
                             stt = data.get("status")
                             if stt:
                                 last_status = stt
+                            tgt = extract_scan_targets_from_data(data)
+                            if tgt:
+                                target_label = tgt
                     elif t:
                         events += 1
                         vd, fd = classify_issue_counts(ev)
@@ -1977,7 +3062,7 @@ class BrowserScreen(Screen):
             except Exception:
                 pass
 
-        summary = (last_status, events, vulns, findings, modified, st.st_mtime)
+        summary = (last_status, events, vulns, findings, modified, st.st_mtime, target_label)
         self._summary_cache[key] = (st.st_mtime, st.st_size, summary)
         return summary
 
@@ -2020,7 +3105,10 @@ class BrowserScreen(Screen):
         q = self.filter_query.strip().lower()
         if not q:
             return list(src)
-        return [r for r in src if q in r["name"].lower()]
+        return [
+            r for r in src
+            if q in r["name"].lower() or q in str(r.get("target") or "").lower()
+        ]
 
     def _rebuild_table(self) -> None:
         table = self.query_one("#browser-table", SelectableTable)
@@ -2032,10 +3120,14 @@ class BrowserScreen(Screen):
         except Exception:
             selected_name = None
 
-        table.clear()
+        labels = ["Name", "Target", "Status", "Events", "Vulns", "Findings", "Modified"]
+        vis = table.visible_column_labels(labels)
+        table.clear(columns=True)
+        table.add_columns(*vis)
         self.rows = self._filtered_rows()
 
         restore_idx = 0
+        packed = []
         for i, row in enumerate(self.rows):
             if selected_name and row.get("name") == selected_name:
                 restore_idx = i
@@ -2056,17 +3148,29 @@ class BrowserScreen(Screen):
             findings = row.get("finding_count", 0)
             vcell = Text(f"⚠ {vulns}", style="bold red") if vulns else Text(str(vulns), style="dim")
             fcell = Text(f"⚠ {findings}", style="bold yellow") if findings else Text(str(findings), style="dim")
+            target = str(row.get("target") or "")
 
-            table.add_row(
+            cells = table.filter_cells(labels, (
                 Text(row["name"], no_wrap=True, overflow="ellipsis"),
+                Text(target, no_wrap=True, overflow="ellipsis"),
                 st,
                 f"{row.get('event_count', 0):,}",
                 vcell,
                 fcell,
                 str(row.get("modified", "")),
-            )
+            ))
+            packed.append((cells, row))
+
+        table.add_payload_rows(packed)
+        self.rows = table.payloads_in_view_order() or self.rows
 
         if self.rows:
+            # Recompute restore after possible sort
+            restore_idx = 0
+            for i, row in enumerate(self.rows):
+                if selected_name and row.get("name") == selected_name:
+                    restore_idx = i
+                    break
             table.move_cursor(row=min(restore_idx, len(self.rows) - 1))
 
         n = len(self.rows)
@@ -2074,8 +3178,18 @@ class BrowserScreen(Screen):
         running = sum(1 for s in self.scans if s.get("status") == "RUNNING")
         self.query_one("#browser-status", Static).update(
             f"[dim]{n}/{total} shown[/]  ·  [green]{running} running[/]  ·  "
-            f"Enter open · c row · C/Shift+C table · a archive · d delete · ? help"
+            f"Enter open · click header sort · h hide col · +/- width · c/C copy"
         )
+
+    def on_selectable_table_view_order_changed(self, event: SelectableTable.ViewOrderChanged) -> None:
+        if event.table.id != "browser-table":
+            return
+        if event.reload:
+            self._rebuild_table()
+            return
+        ordered = event.table.payloads_in_view_order()
+        if ordered:
+            self.rows = ordered
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "browser-filter":
@@ -2285,9 +3399,10 @@ VIEWS = [
     ("emails", "4  Emails"),
     ("social", "5  Social"),
     ("subs", "6  Subdomains"),
-    ("events", "7  Events"),
-    ("stats", "8  Stats"),
-    ("config", "9  Preset"),
+    ("shots", "7  Screenshots"),
+    ("events", "8  Events"),
+    ("stats", "9  Stats"),
+    ("config", "0  Preset"),
 ]
 
 # Event types for the intel menus (BBOT names)
@@ -2333,9 +3448,12 @@ class WorkspaceScreen(Screen):
         Binding("4", "view_emails", "Emails", show=False),
         Binding("5", "view_social", "Social", show=False),
         Binding("6", "view_subs", "Subs", show=False),
-        Binding("7", "view_events", "Events", show=False),
-        Binding("8", "view_stats", "Stats", show=False),
-        Binding("9", "view_config", "Config", show=False),
+        Binding("7", "view_shots", "Shots", show=False),
+        Binding("8", "view_events", "Events", show=False),
+        Binding("9", "view_stats", "Stats", show=False),
+        Binding("0", "view_config", "Config", show=False),
+        Binding("enter", "zoom_shot", "Zoom shot", show=False),
+        Binding("o", "open_shot", "Open shot", show=False),
     ]
 
     current_view = reactive("vulns")
@@ -2429,6 +3547,7 @@ class WorkspaceScreen(Screen):
         vulns = len(self.scan_data.iter_vulnerability_events())
         findings = len(self.scan_data.iter_finding_events())
         subs = len(self.scan_data.iter_subdomain_events())
+        shots = len(self.scan_data.iter_screenshot_events())
         return {
             "vulns": vulns,
             "findings": findings,
@@ -2436,6 +3555,7 @@ class WorkspaceScreen(Screen):
             "emails": len(emails),
             "social": len(social_keys),
             "subs": subs,
+            "shots": shots,
             "events": len(self.scan_data.events),
         }
 
@@ -2463,9 +3583,10 @@ class WorkspaceScreen(Screen):
             "emails": f"4  Emails{_cnt(c['emails'])}",
             "social": f"5  Social{_cnt(c['social'])}",
             "subs": f"6  Subdomains{_cnt(c['subs'])}",
-            "events": f"7  Events{_cnt(c['events'])}",
-            "stats": "8  Stats",
-            "config": "9  Preset",
+            "shots": f"7  Screenshots{_cnt(c['shots'])}",
+            "events": f"8  Events{_cnt(c['events'])}",
+            "stats": "9  Stats",
+            "config": "0  Preset",
         }
         # Always show all views (empty Subdomains is fine)
         for key, _ in VIEWS:
@@ -2480,6 +3601,10 @@ class WorkspaceScreen(Screen):
             ol.highlighted = 0
 
     def on_unmount(self) -> None:
+        try:
+            self.query_one("#ws-table", SelectableTable).save_layout()
+        except Exception:
+            pass
         if self._timer:
             self._timer.stop()
         if self._search_timer:
@@ -2661,8 +3786,52 @@ class WorkspaceScreen(Screen):
     def action_view_subs(self) -> None:
         self._switch_view("subs")
 
+    def action_view_shots(self) -> None:
+        self._switch_view("shots")
+
     def action_view_config(self) -> None:
         self._switch_view("config")
+
+    def action_zoom_shot(self) -> None:
+        if self.current_view != "shots":
+            return
+        idx = self._detail_index
+        if idx < 0 or idx >= len(self.item_list):
+            table = self.query_one("#ws-table", SelectableTable)
+            idx = table.cursor_row if table.cursor_row is not None else -1
+        if idx < 0 or idx >= len(self.item_list):
+            return
+        item = self.item_list[idx]
+        if not isinstance(item, dict):
+            return
+        fpath = item.get("_screenshot_path") or ""
+        if not fpath:
+            self.notify("No screenshot file on disk", severity="warning", timeout=2)
+            return
+        path = Path(fpath)
+        if not path.is_file():
+            self.notify("Screenshot file missing", severity="warning", timeout=2)
+            return
+        self.app.push_screen(ScreenshotPreviewScreen(path))
+
+    def action_open_shot(self) -> None:
+        if self.current_view != "shots":
+            return
+        idx = self._detail_index
+        if idx < 0 or idx >= len(self.item_list):
+            table = self.query_one("#ws-table", SelectableTable)
+            idx = table.cursor_row if table.cursor_row is not None else -1
+        if idx < 0 or idx >= len(self.item_list):
+            return
+        item = self.item_list[idx]
+        if not isinstance(item, dict):
+            return
+        fpath = item.get("_screenshot_path") or ""
+        if not fpath or not Path(fpath).is_file():
+            self.notify("No screenshot file on disk", severity="warning", timeout=2)
+            return
+        open_path_external(Path(fpath))
+        self.notify(f"Opened {Path(fpath).name}", timeout=2)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "view-list" and event.option.id:
@@ -2690,8 +3859,14 @@ class WorkspaceScreen(Screen):
             self._refresh_platform_filter_options()
 
         table = self.query_one("#ws-table", SelectableTable)
+        table.set_layout_key(f"ws:{view}")
         table.clear(columns=True)
+        table.track_hover = view != "shots"
         detail = self.query_one("#ws-detail", DetailPane)
+        try:
+            detail.styles.width = "42%"
+        except Exception:
+            pass
 
         if view == "vulns":
             table.add_columns("Severity", "Host", "Name", "Confidence", "Status", "Module")
@@ -2709,6 +3884,8 @@ class WorkspaceScreen(Screen):
             table.add_columns("Metric", "Count", "%", "Graph")
         elif view == "subs":
             table.add_columns("Subdomain", "Module", "Scope", "Tags", "Resolved")
+        elif view == "shots":
+            table.add_columns("URL", "File", "Module", "Scope")
         elif view == "config":
             table.add_columns("File")
             detail.set_text(
@@ -2953,6 +4130,25 @@ class WorkspaceScreen(Screen):
                 if len(rows) >= max_rows:
                     break
 
+        elif view == "shots":
+            for ev in self.scan_data.iter_screenshot_events():
+                url = str(ev.get("_screenshot_url") or "")
+                fpath = str(ev.get("_screenshot_path") or "")
+                fname = Path(fpath).name if fpath else "(missing)"
+                module = str(ev.get("module") or "gowitness")
+                blob = f"{url} {fname} {module}"
+                if not self._matches_search(blob):
+                    continue
+                self.item_list.append(ev)
+                rows.append((
+                    Text(url, no_wrap=True, overflow="ellipsis"),
+                    Text(fname, no_wrap=True, overflow="ellipsis"),
+                    Text(module, no_wrap=True, overflow="ellipsis"),
+                    str(ev.get("scope_distance", "")),
+                ))
+                if len(rows) >= max_rows:
+                    break
+
         elif view == "events":
             for ev in self._iter_typed_events(include_scan=True):
                 if not self._matches_type(ev):
@@ -3061,7 +4257,14 @@ class WorkspaceScreen(Screen):
                     rows.append(_row(f"status:{st}", cnt, max_st))
 
             if rows:
-                table.add_rows(rows)
+                packed = list(zip(rows, self.item_list))
+                if len(packed) == len(rows):
+                    table.add_payload_rows(packed)
+                    ordered = table.payloads_in_view_order()
+                    if ordered:
+                        self.item_list = ordered
+                else:
+                    table.add_rows(rows)
             detail.set_text("Statistics · charts", report, self._stats_json)
             return
 
@@ -3091,7 +4294,14 @@ class WorkspaceScreen(Screen):
                     break
 
         if rows:
-            table.add_rows(rows)
+            packed = list(zip(rows, self.item_list))
+            if len(packed) == len(rows):
+                table.add_payload_rows(packed)
+                ordered = table.payloads_in_view_order()
+                if ordered:
+                    self.item_list = ordered
+            else:
+                table.add_rows(rows)
 
         if self.item_list:
             idx = old if old is not None and 0 <= old < len(self.item_list) else 0
@@ -3116,6 +4326,23 @@ class WorkspaceScreen(Screen):
             return
         item = self.item_list[index]
         view = self.current_view
+
+        if view == "shots":
+            if not isinstance(item, dict):
+                detail.set_empty()
+                return
+            url = str(item.get("_screenshot_url") or "")
+            fpath = item.get("_screenshot_path") or ""
+            path = Path(fpath) if fpath else None
+            caption = format_event_plain(item, self.scan_data)
+            if url:
+                caption = f"URL: {url}\nFile: {fpath or '(not found)'}\n\n" + caption
+            detail.set_screenshot(
+                f"Screenshot · {url or 'image'}  (Enter=zoom · o=open file)",
+                caption,
+                path,
+            )
+            return
 
         if view in ("vulns", "findings", "events", "ips", "emails", "social", "subs"):
             if not isinstance(item, dict):
@@ -3218,6 +4445,16 @@ class WorkspaceScreen(Screen):
         if event.data_table.id == "ws-table":
             self._show_detail(event.cursor_row)
 
+    def on_selectable_table_view_order_changed(self, event: SelectableTable.ViewOrderChanged) -> None:
+        if event.table.id != "ws-table":
+            return
+        if event.reload:
+            self._reload_items()
+            return
+        ordered = event.table.payloads_in_view_order()
+        if ordered:
+            self.item_list = ordered
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "ws-search":
             self.filter_query = event.value or ""
@@ -3241,7 +4478,7 @@ class WorkspaceScreen(Screen):
             self._reload_items()
 
     def _current_event(self) -> Optional[dict]:
-        if self.current_view not in ("vulns", "findings", "events", "ips", "emails", "social", "subs"):
+        if self.current_view not in ("vulns", "findings", "events", "ips", "emails", "social", "subs", "shots"):
             return None
         table = self.query_one("#ws-table", SelectableTable)
         i = table.cursor_row
@@ -3433,6 +4670,9 @@ class BBotViewer(App):
 
     #browser-table, #ws-table {
         height: 1fr;
+        overflow-x: auto;
+        overflow-y: auto;
+        scrollbar-gutter: stable;
     }
 
     #browser-status {
@@ -3498,6 +4738,54 @@ class BBotViewer(App):
         height: 1fr;
         border: none;
         padding: 0 1;
+    }
+
+    #shot-box {
+        height: 1fr;
+        min-height: 12;
+        width: 100%;
+        overflow: hidden;
+        align: center middle;
+        padding: 0 1;
+    }
+
+    #shot-scroll {
+        height: 1fr;
+        overflow: auto;
+    }
+
+    #shot-view {
+        height: auto;
+        width: auto;
+        padding: 0 1;
+    }
+
+    #shot-img {
+        width: auto;
+        height: auto;
+    }
+
+    #shot-full-img {
+        width: auto;
+        height: auto;
+        margin: 1 2;
+    }
+
+    #shot-full-dialog {
+        width: 100%;
+        height: 100%;
+        background: $surface;
+        padding: 0 1;
+    }
+
+    #shot-full-scroll {
+        height: 1fr;
+        overflow: auto;
+    }
+
+    #shot-full {
+        height: auto;
+        width: auto;
     }
 
     #dialog, #annotation-dialog, #help-dialog {
