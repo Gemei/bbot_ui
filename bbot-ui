@@ -1852,6 +1852,32 @@ class SelectableTable(DataTable):
             return ""
         return self.export_markdown(row_indices=[row])
 
+    def export_selected_cell(self) -> tuple:
+        """Return (column_label, cell_text) for the cursor row + last-used column."""
+        row = self.cursor_row
+        if row is None or row < 0 or self.row_count == 0:
+            return ("", "")
+        vals = self.row_values(row)
+        labels = [self._col_label(c) for c in self.ordered_columns]
+        if not vals or not labels:
+            return ("", "")
+        idx = min(max(0, self._last_col_index), len(vals) - 1)
+        # Skip hidden (width 0) columns in ordered_columns — they're still present
+        vis = []
+        for i, col in enumerate(self.ordered_columns):
+            lab = self._col_label(col)
+            if lab in self._hidden_labels or int(col.width or 0) == 0:
+                continue
+            vis.append(i)
+        if vis:
+            if idx not in vis:
+                # pick nearest visible
+                idx = min(vis, key=lambda i: abs(i - idx))
+        if idx >= len(vals):
+            return ("", "")
+        lab = labels[idx] if idx < len(labels) else f"Col{idx+1}"
+        return (lab, vals[idx])
+
     def export_all_markdown(self) -> str:
         """Export the full visible table as markdown."""
         return self.export_markdown(row_indices=None)
@@ -2144,6 +2170,19 @@ class SelectableTable(DataTable):
         except Exception:
             pass
 
+    def _column_index_at_x(self, x: int) -> Optional[int]:
+        acc = 1
+        if getattr(self, "show_row_labels", False):
+            acc += 4
+        for i, col in enumerate(self.ordered_columns):
+            w = int(col.width or getattr(col, "content_width", 0) or 8)
+            if w <= 0:
+                continue
+            if acc <= x < acc + w + 1:
+                return i
+            acc += w + 1
+        return None
+
     def on_mouse_down(self, event) -> None:
         # Drag the header's right edge to resize (y==0 is the header row).
         try:
@@ -2151,6 +2190,9 @@ class SelectableTable(DataTable):
             x = event.x
         except Exception:
             return
+        col_at = self._column_index_at_x(x)
+        if col_at is not None:
+            self._last_col_index = col_at
         if y != 0:
             return
         nearest = None
@@ -2159,18 +2201,6 @@ class SelectableTable(DataTable):
                 nearest = (idx, abs(x - edge_x))
                 break
         if nearest is None:
-            # Clicking a header still selects that column for +/- resize
-            acc = 1
-            if getattr(self, "show_row_labels", False):
-                acc += 4
-            for i, col in enumerate(self.ordered_columns):
-                w = int(col.width or getattr(col, "content_width", 0) or 8)
-                if w <= 0:
-                    continue
-                if acc <= x < acc + w + 1:
-                    self._last_col_index = i
-                    break
-                acc += w + 1
             return
         idx = nearest[0]
         cols = list(self.ordered_columns)
@@ -2590,6 +2620,7 @@ class HelpScreen(ModalScreen[None]):
     HELP = """BBOT TUI — Help
 
 COPYING
+  v              Copy one cell (current row, last-clicked column)
   c              Copy selected table row (markdown)
   Shift+C / C    Copy entire visible table (markdown)
   Ctrl+Shift+C   Same as Shift+C (if terminal blocks Shift+C)
@@ -2606,6 +2637,7 @@ BROWSER (scan list)
   u       Unarchive selected archive
   d       Delete selected
   r       Refresh
+  v       Copy cell
   c / C   Copy row / whole table
   ?       Help
   q       Quit
@@ -2624,6 +2656,7 @@ WORKSPACE (inside a scan)
   x       Mark false positive
   i       Mark accepted risk
   r       Refresh
+  v       Copy cell (click the column first)
   c / C   Copy row / whole table
   y       Copy JSON details
   q/Esc   Back to browser
@@ -2771,6 +2804,7 @@ class BrowserScreen(Screen):
         Binding("u", "unarchive", "Unarchive"),
         Binding("d", "delete", "Delete"),
         Binding("c", "copy_row", "Copy row"),
+        Binding("v", "copy_cell", "Copy cell"),
         # Many terminals send uppercase C for Shift+C; bind both + priority
         Binding("shift+c,C,ctrl+shift+c", "copy_table", "Copy table", priority=True),
         Binding("question_mark", "help", "Help"),
@@ -3240,6 +3274,15 @@ class BrowserScreen(Screen):
                 )
         notify_copied(self, "row (markdown)", text)
 
+    def action_copy_cell(self) -> None:
+        """Copy one cell: current row × last-clicked column (click a cell or header first)."""
+        table = self.query_one("#browser-table", SelectableTable)
+        lab, val = table.export_selected_cell()
+        if not lab and not val:
+            self.notify("Select a row and click a column first", severity="warning", timeout=2)
+            return
+        notify_copied(self, lab or "cell", val)
+
     def action_copy_table(self) -> None:
         """Copy entire browser table as a markdown table."""
         table = self.query_one("#browser-table", SelectableTable)
@@ -3433,6 +3476,7 @@ class WorkspaceScreen(Screen):
         Binding("slash", "focus_filter", "Filter"),
         Binding("f", "focus_filter", "Filter", show=False),
         Binding("c", "copy_row", "Copy row"),
+        Binding("v", "copy_cell", "Copy cell"),
         # Many terminals send uppercase C for Shift+C; bind both + priority
         Binding("shift+c,C,ctrl+shift+c", "copy_table", "Copy table", priority=True),
         Binding("y", "copy_json", "JSON"),
@@ -4511,6 +4555,15 @@ class WorkspaceScreen(Screen):
             notify_copied(self, "details", detail.plain_text)
             return
         notify_copied(self, "row (markdown)", text)
+
+    def action_copy_cell(self) -> None:
+        """Copy one cell: current row × last-clicked column (click a cell or header first)."""
+        table = self.query_one("#ws-table", SelectableTable)
+        lab, val = table.export_selected_cell()
+        if not lab and not val:
+            self.notify("Select a row and click a column first", severity="warning", timeout=2)
+            return
+        notify_copied(self, lab or "cell", val)
 
     def action_copy_table(self) -> None:
         """Copy the entire visible table as a markdown table."""
